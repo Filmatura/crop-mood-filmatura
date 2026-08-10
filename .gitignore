@@ -69,3 +69,4 @@ platform/*/EOSM_202.sym
 zip/
 magiclantern-*.zip
 tags
+.github/workflows/
