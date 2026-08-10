@@ -1,0 +1,15 @@
+# Local build overrides (not tracked upstream). See Makefile.user.default for all options.
+
+# Era-correct toolchain (the exact one Makefile.setup.toolchain lists as
+# "Preferred"), run under Rosetta 2. Switched from a modern GCC 15 build
+# after confirming (via a control test with the boot splash fully disabled)
+# that crop_rec/mlv_lite froze the camera on THIS core regardless of splash
+# code -- pointing at a compiler-era mismatch, not application logic. GCC 15
+# needed -fcommon and several -Wno-error= overrides just to compile this
+# codebase at all, which was itself a sign of being far outside the range
+# this firmware was ever built/tested against.
+PREFERRED_ARM_PATH=~/gcc-arm-none-eabi-5_4-2016q3
+
+# default is python2 (not installed on this Mac). modules/readme2modulestrings.py
+# was simplified to be python3-compatible (see that file for why).
+PYTHON=python3
