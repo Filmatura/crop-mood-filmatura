@@ -4360,9 +4360,7 @@ cleanup:
 
         if (crop_rec_is_enabled())
         {
-#ifdef CONFIG_EOSM
-            CheckPreviewRegsValuesAndForce();
-#else
+#ifndef CONFIG_EOSM
             if (cam_650d || cam_700d || cam_eos_m || cam_100d) // what about other models?
             {
                 if (lv_dispsize == 5)

@@ -548,7 +548,11 @@ static void audio_common_task(void * unused)
     TASK_LOOP
     {
         msleep(MIN_MSLEEP);
-        int meters_sleep_cycles = (DISPLAY_IS_ON ? (50/MIN_MSLEEP) : (500/MIN_MSLEEP));
+        /* Preserve level sampling accuracy, but draw meters less often while
+         * recording so their bitmap updates consume less display bandwidth. */
+        int meter_refresh_ms = RECORDING ? 100 : 50;
+        int meters_sleep_cycles = DISPLAY_IS_ON ?
+            (meter_refresh_ms / MIN_MSLEEP) : (500 / MIN_MSLEEP);
         meters_slept_times++;
         compute_audio_levels(0);
         compute_audio_levels(1);

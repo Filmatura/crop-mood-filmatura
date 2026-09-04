@@ -650,7 +650,7 @@ static uint32_t mlv_play_osd_draw()
 
     /* undraw last drawn OSD item */
     static char osd_line[64] = "";
-    
+
     uint32_t w = bmp_string_width(FONT_LARGE, osd_line);
     uint32_t h = fontspec_height(FONT_LARGE);
     bmp_fill(COLOR_EMPTY, mlv_play_osd_x - w/2 - border, mlv_play_osd_y - border, w + 2 * border, h + 2 * border);
@@ -722,7 +722,7 @@ static uint32_t mlv_play_osd_draw()
     w = bmp_string_width(FONT_LARGE, osd_line);
     bmp_fill(COLOR_BG, mlv_play_osd_x - w/2 - border, mlv_play_osd_y - border, w + 2 * border, h + 2 * border);
     bmp_printf(FONT(FONT_LARGE,COLOR_WHITE,COLOR_BG), mlv_play_osd_x - w/2, mlv_play_osd_y, osd_line);
-    
+
     /* draw selected item over with blue background */
     bmp_printf(FONT(FONT_LARGE,COLOR_WHITE,COLOR_BLUE), mlv_play_osd_x - w/2 + selected_x, mlv_play_osd_y, "  %s  ", selected_item);
     
@@ -2582,7 +2582,7 @@ static void mlv_play_enter_playback()
     /* prepare display */
     NotifyBoxHide();
     enter_play_mode();
-    
+
     /* render task is slave and controlled via these variables */
     mlv_play_render_abort = 0;
     mlv_play_rendering = 1;

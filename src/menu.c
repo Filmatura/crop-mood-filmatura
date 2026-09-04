@@ -3088,10 +3088,14 @@ skip_name:
         (settings_custom_marker ? 660 : 696);
     int draw_custom_marker = slim_style && entry->starred &&
         !customize_mode && !junkie_mode && !menu_custom_is_active();
-    if (draw_custom_marker)
+    int reserve_lut_marker = slim_style && entry->name &&
+        streq(entry->name, "LUT Preview");
+    if (draw_custom_marker || reserve_lut_marker)
     {
-        /* Keep arrows, values and the Settings scrollbar clear. */
-        x_end = MIN(x_end - 36, custom_marker_x - 18);
+        /* Keep arrows and values clear of a present or future Custom marker. */
+        if (draw_custom_marker)
+            x_end -= 36;
+        x_end = MIN(x_end, custom_marker_x - 18);
     }
 #endif
     
@@ -3104,6 +3108,22 @@ skip_name:
     
     // value string too big? move it to the left
     int val_width = bmp_string_width(fnt, info->value);
+#ifdef CONFIG_SLIM_MENUS
+    if (reserve_lut_marker && draw_tri_arrows)
+    {
+        /* Dynamic LUT filenames may be much longer than ordinary values.
+         * Preserve the beginning, trim only the invisible tail, and keep the
+         * complete displayed text strictly between the two arrow slots. */
+        int max_value_width = x_end - x - w -
+            2 * (arrow_w + arrow_pad);
+        int len = strlen(info->value);
+        while (len > 1 && val_width > max_value_width)
+        {
+            info->value[--len] = '\0';
+            val_width = bmp_string_width(fnt, info->value);
+        }
+    }
+#endif
     /* Secondary text after arrows (shutter angle digits + drawn ° in Canon style) */
     int adj_rinfo_w = 0;
 #ifdef CONFIG_SLIM_MENUS
@@ -6143,6 +6163,7 @@ static struct menu_entry *custom_original_entry(struct menu_entry *entry)
 
 static void custom_toggle_selected_entry(void)
 {
+    int custom_active = menu_custom_is_active();
     struct menu_entry *shown =
         get_selected_menu_entry(get_current_menu_or_submenu());
     struct menu_entry *entry = custom_original_entry(shown);
@@ -6158,6 +6179,10 @@ static void custom_toggle_selected_entry(void)
     entry->starred = !entry->starred;
     menu_flags_save_dirty = 1;
     custom_menu_dirty = 1;
+    /* A Custom-page long SET removes the original mark immediately, then
+     * rebuilds the visible list rather than leaving a stale copied row. */
+    if (custom_active)
+        custom_menu_rebuild();
     menu_redraw_full();
 }
 
@@ -6182,8 +6207,7 @@ static int custom_handle_set_hold(struct event *event)
     }
 
     if (event->param == BGMT_PRESS_SET && !IS_FAKE(event) &&
-        !menu_grid_is_active() && !menu_quick_screen_is_active() &&
-        !menu_custom_is_active())
+        !menu_grid_is_active() && !menu_quick_screen_is_active())
     {
         custom_set_hold_pressed = 1;
         custom_set_hold_fired = 0;
@@ -7754,8 +7778,20 @@ int handle_longpress_events(struct event * event)
     {
         if (!gui_menu_shown() && !IS_FAKE(event))
         {
+            /* EOS M may repeat BGMT_PRESS_UP while the pad is still held.
+             * Treat repeats as part of the current gesture. Resetting here
+             * used to create multiple timer chains: one could open Custom
+             * while another emitted the short UP action (e.g. ISO +1). */
+            if (custom_up_longpress.pressed)
+                return 0;
+
             custom_up_longpress.pressed = 1;
-            custom_up_longpress.count = 0;
+            custom_up_longpress.count = 2;
+            custom_up_longpress.action_disabled = 0;
+
+            /* Give immediate feedback instead of waiting for the first GUI
+             * timer callback. count=2 paints the first progress dot. */
+            draw_longpress_indicator(&custom_up_longpress);
             delayed_call(20, longpress_check, &custom_up_longpress);
             return 0;
         }

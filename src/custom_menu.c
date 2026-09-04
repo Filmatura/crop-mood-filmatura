@@ -12,7 +12,6 @@
 static struct menu_entry custom_menu_placeholders[] =
 {
     { .name = "Boot Logo",           .placeholder = 1 },
-    { .name = "Digic Peaking",       .placeholder = 1 },
     { .name = "Screen Layout",       .placeholder = 1 },
     { .name = "INFO Button",         .placeholder = 1 },
     { .name = "SET Button",          .placeholder = 1 },

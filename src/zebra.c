@@ -42,9 +42,30 @@
 #include "powersave.h"
 #include "menu-grid.h"
 
+#ifdef CONFIG_SLIM_MENUS
+#include "module.h"
+
+/* Keep zebra drawing out of the bitmap layer while Dual ISO is recording.
+ * Dual ISO owns the alternating-row preview at that point; its zebra pass
+ * adds work and makes the striped preview harder to judge. */
+static int (*dual_iso_is_enabled)() = MODULE_FUNCTION(dual_iso_is_enabled);
+
+static int slim_hide_zebras_during_dual_iso_recording(void)
+{
+    return RECORDING && dual_iso_is_enabled && dual_iso_is_enabled();
+}
+#endif
+
 #include "imgconv.h"
 #include "falsecolor.h"
 #include "histogram.h"
+
+#ifdef CONFIG_SLIM_MENUS
+extern int lut_preview;
+extern void lut_preview_toggle(void *priv, int delta);
+extern MENU_UPDATE_FUNC(lut_preview_menu_update);
+extern int lut_preview_worker_needed(void);
+#endif
 
 /* todo: move battery stuff in battery.c */
 #include "battery.h"
@@ -195,6 +216,9 @@ static CONFIG_INT( "zebra.thr.lo",    zebra_level_lo, 0 );
 static CONFIG_INT( "zebra.rec", zebra_rec,  1 );
 #ifdef CONFIG_SLIM_MENUS
 static CONFIG_INT( "zebra.raw.under", zebra_raw_underexposure,  0 );
+#define ZEBRA_MODE_OVER       MONITOR_PERFORMANCE
+#define ZEBRA_MODE_OVER_UNDER 2
+#define ZEBRA_MODE_MAX        ZEBRA_MODE_OVER_UNDER
 #else
 static CONFIG_INT( "zebra.raw.under", zebra_raw_underexposure,  1 );
 #endif
@@ -310,9 +334,60 @@ int nondigic_zoom_overlay_enabled()
 
 static CONFIG_INT( "focus.peaking", focus_peaking, 0);
 //~ static CONFIG_INT( "focus.peaking.method", focus_peaking_method, 1);
+#ifdef CONFIG_SLIM_MENUS
+/* Keep Danne's focus-peaking detector with a practical Slim default:
+ * Balanced detection, a 0.5% target density and red dots. Slim-specific
+ * config keys prevent obsolete hidden tuning from overriding these defaults
+ * after an upgrade. */
+static CONFIG_INT( "focus.peaking.slim.filter.edges", focus_peaking_filter_edges, 1);
+static CONFIG_INT( "focus.peaking.slim.thr", focus_peaking_pthr, 5);
+static CONFIG_INT( "focus.peaking.slim.color", focus_peaking_color, 0);
+extern int preview_peaking;
+static CONFIG_INT("focus.assist.mode", focus_assist_mode, 0);
+
+enum slim_focus_assist_mode
+{
+    FOCUS_ASSIST_OFF = 0,
+    FOCUS_ASSIST_PEAKING,
+    FOCUS_ASSIST_SHARPER_IMAGE,
+    FOCUS_ASSIST_EDGE_DETECT,
+};
+
+/* Keep the menu's plain-language order independent from the original DIGIC
+ * register values. Focus Peaking is the regular ML dot overlay; only Sharper
+ * Image and Edge Detect use the DIGIC display filter. */
+static void slim_focus_assist_apply_mode(void)
+{
+    if (focus_assist_mode < FOCUS_ASSIST_OFF ||
+        focus_assist_mode > FOCUS_ASSIST_EDGE_DETECT)
+        focus_assist_mode = FOCUS_ASSIST_OFF;
+
+    /* Focus Assist owns both implementations. Always set both states so a
+     * previously selected DIGIC filter cannot leak into Focus Peaking, and a
+     * previous dot overlay cannot remain in the other modes. */
+    focus_peaking = focus_assist_mode == FOCUS_ASSIST_PEAKING;
+    preview_peaking =
+        focus_assist_mode == FOCUS_ASSIST_SHARPER_IMAGE ? 1 :
+        focus_assist_mode == FOCUS_ASSIST_EDGE_DETECT ? 2 : 0;
+
+}
+
+static MENU_SELECT_FUNC(slim_focus_assist_select)
+{
+    int *value = priv;
+    if (!value) return;
+
+    int mode = *value + delta;
+    while (mode < FOCUS_ASSIST_OFF) mode += FOCUS_ASSIST_EDGE_DETECT + 1;
+    while (mode > FOCUS_ASSIST_EDGE_DETECT) mode -= FOCUS_ASSIST_EDGE_DETECT + 1;
+    *value = focus_assist_mode = mode;
+    slim_focus_assist_apply_mode();
+}
+#else
 static CONFIG_INT( "focus.peaking.filter.edges", focus_peaking_filter_edges, 0); // prefer texture details rather than strong edges
 static CONFIG_INT( "focus.peaking.thr", focus_peaking_pthr, 5); // 1%
 static CONFIG_INT( "focus.peaking.color", focus_peaking_color, 7); // R,G,B,C,M,Y,cc1,cc2
+#endif
 CONFIG_INT( "focus.peaking.grayscale", focus_peaking_grayscale, 0); // R,G,B,C,M,Y,cc1,cc2
 
 #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
@@ -321,7 +396,7 @@ static CONFIG_INT( "focus.peaking.disp", focus_peaking_disp, 0); // display as d
 #define focus_peaking_disp 0
 #endif
 
-int focus_peaking_as_display_filter()
+int focus_peaking_as_display_filter() 
 {
     #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
     return lv && focus_peaking && focus_peaking_disp;
@@ -786,7 +861,9 @@ static void zebra_init_slim_palette(void)
     zebra_slim_palette_entry(ZEBRA_PAL_YELLOW,   COLOR_RED, 210, 300, 120);
     zebra_slim_palette_entry(ZEBRA_PAL_MAGENTA,  COLOR_RED, 210, 300, 120);
     zebra_slim_palette_entry(ZEBRA_PAL_RED,      COLOR_RED, 210, 300, 120);
-    zebra_slim_palette_entry(ZEBRA_PAL_BLUE,     COLOR_RED, 210, 300, 120);
+    /* Shadow warning retains the same opacity and sampling as highlight
+     * zebras, but has a dedicated dark-blue palette entry. */
+    zebra_slim_palette_entry(ZEBRA_PAL_BLUE,     COLOR_BLUE, 150, 300, 120);
 }
 
 static void zebra_init_slim_palette_precision(void)
@@ -812,6 +889,21 @@ static void zebra_init_slim_palette_for_mode(void)
 
 static int raw_zebra_color_at(int x, int y, int white, int underexposed);
 
+/* Slim has one deliberate shadow-warning point: 0 EV above the measured
+ * RAW noise floor.  The three Zebra menu modes select it directly, rather
+ * than exposing a second threshold that could disagree with the label. */
+static int raw_zebra_underexposure_threshold(void)
+{
+#ifdef CONFIG_SLIM_MENUS
+    if (zebra_draw != ZEBRA_MODE_OVER_UNDER)
+        return 0;
+    return ev_to_raw(-raw_info.dynamic_range / 100.0);
+#else
+    return zebra_raw_underexposure ?
+        ev_to_raw(- (raw_info.dynamic_range - (zebra_raw_underexposure - 1) * 100) / 100.0) : 0;
+#endif
+}
+
 #ifdef CONFIG_SLIM_MENUS
 static CONFIG_INT("raw.zebra", raw_zebra_enable, 1);
 #else
@@ -830,7 +922,7 @@ static void FAST draw_zebras_raw()
     if (!bvram) return;
 
     int white = raw_info.white_level;
-    int underexposed = zebra_raw_underexposure ? ev_to_raw(- (raw_info.dynamic_range - (zebra_raw_underexposure - 1) * 100) / 100.0) : 0;
+    int underexposed = raw_zebra_underexposure_threshold();
     
     int zoom0 = (int32_t)MEM(IMGPLAY_ZOOM_LEVEL_ADDR); /* stop when zooming in playback */
 
@@ -1069,7 +1161,7 @@ static void FAST draw_zebras_raw_lv()
 
     int white = raw_info.white_level;
     if (white > 16383) white = 15000;
-    int underexposed = zebra_raw_underexposure ? ev_to_raw(- (raw_info.dynamic_range - (zebra_raw_underexposure - 1) * 100) / 100.0) : 0;
+    int underexposed = raw_zebra_underexposure_threshold();
 
     int off = get_y_skip_offset_for_overlays();
 #ifdef CONFIG_SLIM_MENUS
@@ -1263,7 +1355,14 @@ static int zebra_rgb_color(int underexposed, int clipR, int clipG, int clipB, in
 
 static int zebra_rgb_solid_color(int underexposed, int clipR, int clipG, int clipB)
 {
-    if (underexposed) return ZEBRA_COLOR_WORD_SOLID(79);
+    if (underexposed)
+    {
+#ifdef CONFIG_SLIM_MENUS
+        return ZEBRA_COLOR_WORD_SOLID(ZEBRA_PAL_BLUE);
+#else
+        return ZEBRA_COLOR_WORD_SOLID(79);
+#endif
+    }
     
     switch ((clipR ? 4 : 0) |
             (clipG ? 2 : 0) |
@@ -1497,6 +1596,12 @@ void bvram_mirror_init()
 #ifdef FEATURE_FOCUS_PEAK
 static int get_focus_color(int thr, int d)
 {
+#ifdef CONFIG_SLIM_MENUS
+    /* Slim focus peaking deliberately has one readable, consistent color. */
+    (void)thr;
+    (void)d;
+    return COLOR_RED;
+#else
     return
         focus_peaking_color == 0 ? COLOR_RED :
         focus_peaking_color == 1 ? 7 :
@@ -1514,6 +1619,7 @@ static int get_focus_color(int thr, int d)
                                      d > 30 ? 15 /*yellow*/ :
                                      d > 20 ? 5 /*cyan*/ : 
                                      9 /*light blue*/) : 1;
+#endif
 }
 #endif
 
@@ -1588,6 +1694,9 @@ static void draw_zebras( int Z )
 {
     uint8_t * const bvram = bmp_vram_real();
     int zd = Z && monitoring_enabled(zebra_draw) && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
+#ifdef CONFIG_SLIM_MENUS
+    if (slim_hide_zebras_during_dual_iso_recording()) zd = 0;
+#endif
     if (zd)
     {
         #ifdef FEATURE_RAW_ZEBRAS
@@ -2188,15 +2297,22 @@ draw_zebra_and_focus( int Z, int F )
             #undef M2
         }
         dirty_pixels_num = 0;
-
+        
         uint32_t vram = (uint32_t)CACHEABLE(YUV422_LV_BUFFER_DISPLAY_ADDR);
         if (!vram) return 0;
         
         int off = get_y_skip_offset_for_overlays();
-        int yStart = os.y0 + off + 8;
-        int yEnd = os.y_max - off - 8;
-        int xStart = os.x0 + 8;
-        int xEnd = os.x_max - 8;
+#ifdef CONFIG_SLIM_MENUS
+        /* Preserve the status-bar/letterbox boundary exclusion: these pixels
+         * are display transitions, not focus detail. */
+        const int focus_guard = 18;
+#else
+        const int focus_guard = 8;
+#endif
+        int yStart = os.y0 + off + focus_guard;
+        int yEnd = os.y_max - off - focus_guard;
+        int xStart = os.x0 + focus_guard;
+        int xEnd = os.x_max - focus_guard;
         int n_over = 0;
 
         #ifdef FEATURE_ANAMORPHIC_PREVIEW
@@ -2352,6 +2468,15 @@ clrscr_mirror( void )
 static MENU_UPDATE_FUNC(monitoring_mode_display)
 {
     MENU_SET_VALUE("%s", CURRENT_VALUE ? "ON" : "OFF");
+}
+
+/* Zebras have a third Slim mode; unlike Histogram/Waveform, its displayed
+ * text must not be collapsed to the generic OFF/ON monitoring label. */
+static MENU_UPDATE_FUNC(zebra_slim_mode_display)
+{
+    MENU_SET_VALUE("%s",
+        CURRENT_VALUE == 0 ? "OFF" :
+        CURRENT_VALUE == ZEBRA_MODE_OVER ? "Over" : "Over+Under");
 }
 #endif
 #ifdef FEATURE_ZEBRA
@@ -3140,13 +3265,13 @@ struct menu_entry zebra_menus[] = {
     {
         .name = "Zebras",
         .priv       = &zebra_draw,
-        .max = MONITOR_PERFORMANCE,
+        .max = ZEBRA_MODE_MAX,
         .icon_type = IT_DICE,
-        .choices = CHOICES("OFF", "ON"),
-        .update     = monitoring_mode_display,
+        .choices = CHOICES("OFF", "Over", "Over+Under"),
+        .update     = zebra_slim_mode_display,
         .edit_mode = EM_INLINE_ADJUST,
-        .help = "RAW RGB zebras: per-channel clip colors from sensor data.",
-        .help2 = "Off: disabled. On: performance overlay.",
+        .help = "RAW sensor zebras for clipped highlights and dark shadows.",
+        .help2 = "Over+Under adds dark-blue pixels at the 0 EV noise floor.",
     },
 #else
     {
@@ -3227,55 +3352,35 @@ struct menu_entry zebra_menus[] = {
         #endif
     #endif
 
-    #ifdef FEATURE_FOCUS_PEAK
+#ifdef FEATURE_FOCUS_PEAK
 #ifdef CONFIG_SLIM_MENUS
     {
-        .name = "Focus Peak",
-        .priv           = &focus_peaking,
-        .max = 1,
-        .icon_type = IT_BOOL,
-        .choices = CHOICES("OFF", "ON"),
+        .name = "Focus Assist",
+        .priv           = &focus_assist_mode,
+        .select         = slim_focus_assist_select,
+        .min            = 0,
+        .max            = FOCUS_ASSIST_EDGE_DETECT,
+        .icon_type = IT_DICE,
+        .choices = CHOICES("OFF", "Focus Peaking", "Sharper Image", "Edge Detect"),
         .edit_mode = EM_INLINE_ADJUST,
-        .help = "Show which parts of the image are in focus.",
-        .help2 = "Dial L/R toggles ON/OFF. SET opens tuning options.",
-        .submenu_width = 650,
-        .children =  (struct menu_entry[]) {
-            {
-                .name = "Filter bias",
-                .priv = &focus_peaking_filter_edges,
-                .max = 2,
-                .choices = (const char *[]) {"Strong edges", "Balanced", "Fine details"},
-                .help  = "Fine-tune the focus detection algorithm:",
-                .help2 = "Strong edges: looks for edges, works best in low light.\n"
-                         "Balanced: tries to cover both strong edges and fine details.\n"
-                         "Fine details: looks for microcontrast. Needs lots of light.\n",
-                .icon_type = IT_DICE,
-            },
-            {
-                .name = "Threshold",
-                .priv = &focus_peaking_pthr,
-                .select = focus_peaking_adjust_thr,
-                .max    = 50,
-                .icon_type = IT_PERCENT_LOG,
-                .unit = UNIT_PERCENT_x10,
-                .help = "How many pixels are considered in focus (percentage).",
-            },
-            {
-                .name = "Color",
-                .priv = &focus_peaking_color,
-                .max = 7,
-                .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Global Focus", "Local Focus"},
-                .help = "Focus peaking color (fixed or color coding).",
-                .icon_type = IT_DICE,
-            },
-            {
-                .name = "Grayscale image",
-                .priv = &focus_peaking_grayscale,
-                .max = 1,
-                .help = "Display LiveView image in grayscale.",
-            },
-            MENU_EOL
-        },
+        .help = "DIGIC preview assistance; does not affect the recording.",
+        .help2 = "Focus Peaking uses colored edges. Sharper Image is subtle; Edge Detect is monochrome.",
+        .depends_on = DEP_LIVEVIEW,
+    },
+    {
+        .name = "LUT Preview",
+        .priv = &lut_preview,
+        .select = lut_preview_toggle,
+        .update = lut_preview_menu_update,
+        .max = 5,
+        /* Filenames are populated dynamically, so menu auto-detection cannot
+         * infer a dice control from .choices. Without this, value 0 is
+         * misclassified as a disabled percentage row. */
+        .icon_type = IT_DICE,
+        .edit_mode = EM_INLINE_ADJUST,
+        .help = "Preview-only 3D LUT. Recorded RAW/MLV stays unchanged.",
+        .help2 = "Copy up to 5 named standard .cube LUTs to ML/LUTS and select with Left/Right.",
+        .depends_on = DEP_LIVEVIEW,
     },
 #else
     {
@@ -4186,6 +4291,11 @@ int zebra_should_run()
         !WAVEFORM_FULLSCREEN;
 }
 
+static int livev_hipriority_should_run(void)
+{
+    return zebra_should_run() || lut_preview_worker_needed();
+}
+
 int zebra_draw_enabled(void)
 {
     return monitoring_enabled(zebra_draw);
@@ -4652,17 +4762,41 @@ livev_hipriority_task( void* unused )
 #endif
 
         int zd = monitoring_enabled(zebra_draw) && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras (should match the one from draw_zebra_and_focus)
+#ifdef CONFIG_SLIM_MENUS
+        int hide_zebras_for_dual_iso = slim_hide_zebras_during_dual_iso_recording();
+        if (hide_zebras_for_dual_iso) zd = 0;
+
+        /* Remove the last zebra pixels once, at record start. The normal
+         * overlay passes repaint their own pixels on following frames. */
+        static int dual_iso_zebras_cleared = 0;
+        if (hide_zebras_for_dual_iso && !dual_iso_zebras_cleared)
+        {
+            BMP_LOCK(clrscr_mirror();)
+            dual_iso_zebras_cleared = 1;
+        }
+        else if (!hide_zebras_for_dual_iso)
+        {
+            dual_iso_zebras_cleared = 0;
+        }
+#endif
         if (!zd) digic_zebra_cleanup();
         
 #ifdef CONFIG_RAW_LIVEVIEW
         static int raw_flag = 0;
 #endif
         
-        if (!zebra_should_run())
+        if (!livev_hipriority_should_run())
         {
+            /* A LUT may have just been suspended by REC or x10 while Global
+             * Draw is off. Run filter cleanup once before this task sleeps. */
+            #ifdef CONFIG_DISPLAY_FILTERS
+            extern void display_filter_step(int frame_number);
+            if (lv && !PLAY_OR_QR_MODE && !MENU_MODE)
+                display_filter_step(k);
+            #endif
             while (clearscreen == 1 && (get_halfshutter_pressed() || dofpreview)) msleep(100);
             while (RECORDING_H264_STARTING) msleep(100);
-            if (!zebra_should_run())
+            if (!livev_hipriority_should_run())
             {
                 digic_zebra_cleanup();
                 if (lv && !gui_menu_shown()) redraw();
@@ -4672,7 +4806,7 @@ livev_hipriority_task( void* unused )
                 #ifdef CONFIG_RAW_LIVEVIEW
                 if (raw_flag) { raw_lv_release(); raw_flag = 0; }
                 #endif
-                while (!zebra_should_run()) 
+                while (!livev_hipriority_should_run())
                 {
                     msleep(100);
                 }
@@ -4681,7 +4815,7 @@ livev_hipriority_task( void* unused )
                 crop_set_dirty(10);
                 msleep(500);
             }
-            if (!zebra_should_run())
+            if (!livev_hipriority_should_run())
             {
                 /* false alarm */
                 continue;
@@ -4762,7 +4896,7 @@ livev_hipriority_task( void* unused )
             #ifdef FEATURE_FALSE_COLOR
             if (falsecolor_draw)
             {
-                if (k % 4 == 0)
+                if (k % (RECORDING ? 6 : 4) == 0)
                     BMP_LOCK( if (lv) draw_false_downsampled(); )
             }
             else
@@ -4771,8 +4905,8 @@ livev_hipriority_task( void* unused )
                 BMP_LOCK(
                     if (lv)
                         draw_zebra_and_focus(
-                            k % ((focus_peaking ? 5 : 3) * (RECORDING ? 5 : 1)) == 0, /* should redraw zebras? */
-                            k % 2 == 1  /* should redraw focus peaking? */
+                            k % (focus_peaking ? 5 : 3) == 0, /* zebras retain their normal refresh rate */
+                            k % (RECORDING ? 3 : 2) == 1  /* should redraw focus peaking? */
                         );
                 )
             }
@@ -4786,7 +4920,7 @@ livev_hipriority_task( void* unused )
         #endif
 
         #ifdef CONFIG_ELECTRONIC_LEVEL
-        if (electronic_level && k % 2)
+        if (electronic_level && k % (RECORDING ? 3 : 2))
             BMP_LOCK( if (lv) show_electronic_level(); )
         #endif
 
@@ -4837,7 +4971,9 @@ static void loprio_sleep()
     int fast_refresh =
         (monitoring_enabled(hist_draw) && monitoring_precision(hist_draw)) ||
         (monitoring_enabled(waveform_draw) && monitoring_precision(waveform_draw));
-    msleep(fast_refresh ? 100 : 200);
+    /* Histogram, waveform and similar low-priority overlays need not run
+     * at their idle cadence while the recorder is writing frames. */
+    msleep(RECORDING ? 250 : (fast_refresh ? 100 : 200));
 #else
     msleep(200);
 #endif
@@ -5119,9 +5255,15 @@ static void zebra_init()
     hist_log = 0;
     hist_meter = 0;
     hist_warn = 1; /* slim has no Clip warning menu; dots always follow histogram */
-    if (zebra_draw > MONITOR_PERFORMANCE) zebra_draw = MONITOR_PERFORMANCE;
+    if (zebra_draw > ZEBRA_MODE_MAX) zebra_draw = ZEBRA_MODE_OVER;
     if (hist_draw > MONITOR_PERFORMANCE) hist_draw = MONITOR_PERFORMANCE;
     if (waveform_draw > MONITOR_PERFORMANCE) waveform_draw = MONITOR_PERFORMANCE;
+    #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
+    /* Do not let an old hidden display-filter preference replace Slim's
+     * expected red-dot Focus Peaking overlay. */
+    focus_peaking_disp = 0;
+    #endif
+    slim_focus_assist_apply_mode();
     zebra_init_slim_palette_for_mode();
 #endif
     precompute_yuv2rgb();
