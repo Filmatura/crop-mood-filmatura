@@ -40,6 +40,8 @@
 #include "debug.h"
 #include "lvinfo.h"
 #include "powersave.h"
+#include "gui-common.h"
+#include "module.h"
 
 #define CONFIG_MENU_ICONS
 //~ #define CONFIG_MENU_DIM_HACKS
@@ -106,6 +108,27 @@ static int menu_shown = false;
 static int menu_lv_transparent_mode; // for ISO, kelvin...
 static int config_dirty = 0;
 
+#ifdef CONFIG_SLIM_MENUS
+extern void anamorphic_preview_set_toggle(void);
+
+#define CUSTOM_MENU_NAME "Custom"
+#define CUSTOM_MENU_MAX_ITEMS 8
+static struct menu *custom_menu;
+static int custom_menu_dirty = 1;
+static int (*crop_rec_custom_adjust)(int, int) =
+    MODULE_FUNCTION(crop_rec_custom_adjust);
+static int custom_menu_rebuild(void);
+static int menu_custom_is_active(void);
+
+/* Last highlighted menu row — recording-screen touch opens this (persists across boot). */
+static char last_sel_menu[40];
+static char last_sel_entry[48];
+static int last_sel_dirty = 0;
+static int menu_open_direct = 0;
+static char menu_open_target_menu[40];
+static char menu_open_target_entry[48];
+#endif
+
 static int menu_flags_save_dirty = 0;
 static int menu_flags_load_dirty = 1;
 
@@ -128,6 +151,50 @@ static int caret_position = 0;
 /* fixme: better solution? */
 static struct menu_entry * entry_being_updated = 0;
 static int entry_removed_itself = 0;
+
+#ifdef CONFIG_SLIM_MENUS
+/* Touch hitboxes are populated from the same geometry used to draw arrows. */
+struct slim_touch_arrow_target
+{
+    int x1, y1, x2, y2;
+    struct menu_entry *entry;
+    int mode; /* menu_entry_select: 1 = left/decrement, 0 = right/increment */
+};
+
+static struct slim_touch_arrow_target slim_touch_arrow_targets[32];
+static int slim_touch_arrow_target_count;
+static int slim_touch_scroll_x1, slim_touch_scroll_x2;
+static int slim_touch_scroll_up_y1, slim_touch_scroll_up_y2;
+static int slim_touch_scroll_down_y1, slim_touch_scroll_down_y2;
+static int slim_touch_scroll_pressed;
+static int slim_touch_scroll_direction;
+static int slim_touch_scroll_repeat_ms;
+static int slim_touch_grid_back_x1, slim_touch_grid_back_y1;
+static int slim_touch_grid_back_x2, slim_touch_grid_back_y2;
+
+static void slim_touch_scroll_repeat(int timer, void *opaque);
+static int slim_touch_handle_scroll(int x, int y, int pressed);
+static int slim_touch_handle_grid_back(int x, int y);
+static void slim_draw_scroll_arrow_up(int cx, int cy, int size, int color);
+static void slim_draw_scroll_arrow_down(int cx, int cy, int size, int color);
+
+static void slim_touch_arrow_reset(void)
+{
+    slim_touch_arrow_target_count = 0;
+    slim_touch_scroll_x1 = slim_touch_scroll_x2 = 0;
+    slim_touch_scroll_up_y1 = slim_touch_scroll_up_y2 = 0;
+    slim_touch_scroll_down_y1 = slim_touch_scroll_down_y2 = 0;
+}
+
+static void slim_touch_arrow_add(struct menu_entry *entry, int x1, int y1,
+    int x2, int y2, int mode)
+{
+    if (slim_touch_arrow_target_count >= COUNT(slim_touch_arrow_targets))
+        return;
+    slim_touch_arrow_targets[slim_touch_arrow_target_count++] =
+        (struct slim_touch_arrow_target){ x1, y1, x2, y2, entry, mode };
+}
+#endif
 
 #ifdef FEATURE_JUNKIE_MENU
 static CONFIG_INT("menu.junkie", junkie_mode, 0);
@@ -185,28 +252,15 @@ static int entry_is_slim_style(struct menu_entry * entry, int in_submenu)
 /* Filled ◄ — tip points left (narrow on left, flat base on right). */
 static void slim_draw_arrow_left(int tip_x, int cy, int height, int color)
 {
-    int half = MAX(height / 2, 1);
     int depth = MAX((height * 6) / 10, 2);
-    int base_x = tip_x + depth;
-    for (int dy = -half; dy <= half; dy++)
-    {
-        /* At row center tip is at tip_x; edges pull inward toward the base. */
-        int x0 = tip_x + depth * ABS(dy) / half;
-        draw_line(x0, cy + dy, base_x, cy + dy, color);
-    }
+    bmp_draw_antialiased_triangle(tip_x, cy, 0, depth, height, color);
 }
 
 /* Filled ► — tip points right (flat base on left, narrow on right). */
 static void slim_draw_arrow_right(int tip_x, int cy, int height, int color)
 {
-    int half = MAX(height / 2, 1);
     int depth = MAX((height * 6) / 10, 2);
-    int base_x = tip_x - depth;
-    for (int dy = -half; dy <= half; dy++)
-    {
-        int x1 = tip_x - depth * ABS(dy) / half;
-        draw_line(base_x, cy + dy, x1, cy + dy, color);
-    }
+    bmp_draw_antialiased_triangle(tip_x, cy, 1, depth, height, color);
 }
 #endif
 
@@ -290,7 +344,7 @@ static int redraw_flood_stop = 0;
 
 #define MENU_REDRAW 1
 
-static int hist_countdown = 3; // histogram is slow, so draw it less often
+static int hist_countdown = 3; // throttled while Monitoring menu is transparent
 
 int is_submenu_or_edit_mode_active() { return gui_menu_shown() && SUBMENU_OR_EDIT; }
 int get_menu_edit_mode() { return edit_mode; }
@@ -462,6 +516,8 @@ static struct menu_entry menu_prefs[] = {
 static struct menu_entry mod_menu_placeholders[] = {
     MY_MENU_ENTRY
     MY_MENU_ENTRY
+
+#ifndef CONFIG_LOW_MEM_CAM
     MY_MENU_ENTRY
     MY_MENU_ENTRY
     MY_MENU_ENTRY
@@ -506,6 +562,19 @@ static struct menu_entry mod_menu_placeholders[] = {
 
     MY_MENU_ENTRY
     MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+    MY_MENU_ENTRY
+#endif
+};
+
+#ifdef CONFIG_SLIM_MENUS
+static struct menu_entry custom_menu_placeholders[CUSTOM_MENU_MAX_ITEMS] = {
     MY_MENU_ENTRY
     MY_MENU_ENTRY
     MY_MENU_ENTRY
@@ -515,6 +584,7 @@ static struct menu_entry mod_menu_placeholders[] = {
     MY_MENU_ENTRY
     MY_MENU_ENTRY
 };
+#endif
 
 void customize_menu_init()
 {
@@ -1550,6 +1620,39 @@ void menu_add(
     menu_add_internal(name, new_entry, count);
 
     give_semaphore( menu_sem );
+}
+
+EXCLUDES(menu_sem)
+void menu_move_entry_after(const char * menu_name,
+    const char * entry_name, const char * after_name)
+{
+    take_semaphore(menu_sem, 0);
+
+    struct menu_entry *entry = entry_find_by_name(menu_name, entry_name);
+    struct menu_entry *after = entry_find_by_name(menu_name, after_name);
+    if (!entry || !after || entry == after ||
+        entry->parent_menu != after->parent_menu || entry->prev == after)
+        goto done;
+
+    struct menu *menu = entry->parent_menu;
+    if (entry->prev)
+        entry->prev->next = entry->next;
+    else if (menu)
+        menu->children = entry->next;
+    if (entry->next)
+        entry->next->prev = entry->prev;
+
+    entry->prev = after;
+    entry->next = after->next;
+    if (after->next)
+        after->next->prev = entry;
+    after->next = entry;
+
+    menu_damage = 1;
+    mod_menu_dirty = 1;
+
+done:
+    give_semaphore(menu_sem);
 }
 
 static void menu_remove_entry(struct menu * menu, struct menu_entry * entry)
@@ -2938,24 +3041,25 @@ skip_name:
         fnt = FONT(FONT_CANON, fg, COLOR_BLACK);
     }
 
-    /* Dial arrows around the adjustable value — keep for bool OFF; hide when
-     * the row is locked/greyed (enabled==0 non-bool, or WARN_NOT_WORKING). */
+    /* Keep dial arrows visible on locked rows, but draw the entire control
+     * grey and block adjustment in the input handlers. */
+    int slim_locked =
+        info->warning_level == MENU_WARN_NOT_WORKING ||
+        (info->enabled == 0 && !IS_BOOL(entry));
     int draw_tri_arrows =
         slim_style &&
         entry_is_inline_adjustable(entry) &&
         info->value[0] &&
-        info->warning_level != MENU_WARN_NOT_WORKING &&
-        (info->enabled != 0 || IS_BOOL(entry)) &&
         !menu_lv_transparent_mode &&
         !customize_mode &&
         !junkie_mode;
     int draw_left_arrow = draw_tri_arrows;
     int draw_right_arrow = draw_tri_arrows;
     int arrow_color = COLOR_WHITE;
-    if (draw_tri_arrows && entry->selected)
-        arrow_color = COLOR_ORANGE;
-    if (draw_tri_arrows && info->warning_level == MENU_WARN_NOT_WORKING && !entry->selected)
+    if (draw_tri_arrows && slim_locked)
         arrow_color = COLOR_GRAY(50);
+    else if (draw_tri_arrows && entry->selected)
+        arrow_color = COLOR_ORANGE;
     int fonth = fontspec_font(fnt)->height;
     int tri_h = MAX(fonth - 4, 18); /* match value glyph height */
     int arrow_slot_w = (tri_h * 6) / 10 + 1;
@@ -2977,6 +3081,19 @@ skip_name:
     
     // far right end
     int x_end = in_submenu ? x + g_submenu_width - SUBMENU_OFFSET : 717;
+#ifdef CONFIG_SLIM_MENUS
+    int settings_custom_marker = entry->parent_menu &&
+        streq(entry->parent_menu->name, "Settings");
+    int custom_marker_x = in_submenu ? x_end - 10 :
+        (settings_custom_marker ? 660 : 696);
+    int draw_custom_marker = slim_style && entry->starred &&
+        !customize_mode && !junkie_mode && !menu_custom_is_active();
+    if (draw_custom_marker)
+    {
+        /* Keep arrows, values and the Settings scrollbar clear. */
+        x_end = MIN(x_end - 36, custom_marker_x - 18);
+    }
+#endif
     
     int char_width = fontspec_font(fnt)->width;
     w = MAX(w, bmp_string_width(fnt, info->name) + char_width);
@@ -3040,9 +3157,14 @@ skip_name:
 #ifdef CONFIG_SLIM_MENUS
     /* Optical center of FONT_CANON glyphs */
     int value_cy = y + y_font_offset + (fonth * 9) / 20;
+    int left_touch_target = -1;
     if (draw_left_arrow)
     {
         slim_draw_arrow_left(xval, value_cy, tri_h, arrow_color);
+        left_touch_target = slim_touch_arrow_target_count;
+        slim_touch_arrow_add(entry,
+            xval - arrow_w - arrow_pad - 16, y + 2,
+            xval + 16, y + h - 2, 1);
         x_value = xval + arrow_w + arrow_pad;
     }
     else if (value_left_pad)
@@ -3064,6 +3186,15 @@ skip_name:
     {
         int x_after_value = x_value + val_width + arrow_pad + arrow_w;
         slim_draw_arrow_right(x_after_value, value_cy, tri_h, arrow_color);
+        int right_touch_x1 = x_after_value - 16;
+        slim_touch_arrow_add(entry,
+            right_touch_x1, y + 2,
+            x_after_value + arrow_w + arrow_pad + 16, y + h - 2, 0);
+        /* Keep the two enlarged hitboxes disjoint around narrow values. */
+        if (left_touch_target >= 0 && left_touch_target < slim_touch_arrow_target_count)
+            slim_touch_arrow_targets[left_touch_target].x2 = MIN(
+                slim_touch_arrow_targets[left_touch_target].x2,
+                MAX(slim_touch_arrow_targets[left_touch_target].x1, right_touch_x1));
         /* Secondary text after ► (shutter angle ° ring, or Dual ISO primary/second combo). */
         if (info->rinfo[0])
         {
@@ -3110,6 +3241,14 @@ skip_name:
             info->rinfo
         );
     }
+
+#ifdef CONFIG_SLIM_MENUS
+    if (draw_custom_marker)
+    {
+        int marker_y = y + h / 2;
+        fill_circle(custom_marker_x, marker_y, 8, COLOR_GREEN1);
+    }
+#endif
 
     int y_icon_offset = (h - 32) / 2 - 1;
 
@@ -3177,6 +3316,19 @@ skip_name:
             pickbox_draw(entry, px, y);
         }
     }
+
+#ifdef CONFIG_SLIM_MENUS
+    /* Any touch on a rendered row selects it; arrow targets were registered
+     * earlier and therefore take precedence when the touch hits an arrow. */
+    if (slim_style && !customize_mode && !junkie_mode)
+    {
+        int label_x = x + x_font_offset;
+        int label_w = bmp_string_width(fnt, info->name);
+        int label_x2 = MIN(label_x + label_w + 8, 690);
+        if (label_x2 > label_x)
+            slim_touch_arrow_add(entry, label_x, y, label_x2, y + h, -1);
+    }
+#endif
 
     // display help
 #ifdef CONFIG_SLIM_MENUS
@@ -3388,6 +3540,10 @@ dyn_menu_add_entry(struct menu * dyn_menu, struct menu_entry * entry, struct men
 {
     // copy most things from old menu structure to this one
     // except for some essential things :P
+    ASSERT(dyn_entry);
+    if (dyn_entry == NULL)
+        return;
+
     void* next = dyn_entry->next;
     void* prev = dyn_entry->prev;
     int selected = dyn_entry->selected;
@@ -3529,6 +3685,149 @@ dyn_menu_rebuild(struct menu * dyn_menu, int (*select_func)(struct menu_entry * 
     
     return 1; // success
 }
+
+#ifdef CONFIG_SLIM_MENUS
+static MENU_UPDATE_FUNC(custom_empty_update)
+{
+    MENU_SET_VALUE("");
+    MENU_SET_ENABLED(0);
+}
+
+static MENU_SELECT_FUNC(custom_movie_mode_select)
+{
+    (void)priv;
+    if (crop_rec_custom_adjust)
+        crop_rec_custom_adjust(0, delta);
+}
+
+static MENU_SELECT_FUNC(custom_movie_aspect_select)
+{
+    (void)priv;
+    if (crop_rec_custom_adjust)
+        crop_rec_custom_adjust(1, delta);
+}
+
+static MENU_SELECT_FUNC(custom_movie_preset_select)
+{
+    (void)priv;
+    if (crop_rec_custom_adjust)
+        crop_rec_custom_adjust(2, delta);
+}
+
+static void custom_entry_apply_movie_rules(struct menu_entry *entry)
+{
+    if (!entry || !entry->parent_menu ||
+        !streq(entry->parent_menu->name, "Movie") || !entry->name)
+        return;
+
+    if (streq(entry->name, "Mode"))
+        entry->select = custom_movie_mode_select;
+    else if (streq(entry->name, "Aspect Ratio"))
+        entry->select = custom_movie_aspect_select;
+    else if (streq(entry->name, "Preset"))
+        entry->select = custom_movie_preset_select;
+}
+
+static void custom_placeholder_clear(struct menu_entry *entry)
+{
+    entry->shidden = 1;
+    entry->hidden = 1;
+    entry->jhidden = 1;
+    entry->starred = 0;
+    entry->name = "(empty)";
+    entry->priv = 0;
+    entry->children = 0;
+    entry->select = 0;
+    entry->select_Q = 0;
+    entry->update = 0;
+    entry->parent_menu = custom_menu;
+}
+
+/* Rebuild from original menu entries. The dynamic copies retain the original
+ * update/select data and parent identity, so availability and grey states are
+ * identical to their source rows. */
+static int custom_menu_rebuild(void)
+{
+    char selected_menu[40] = "";
+    char selected_entry[48] = "";
+    int count = 0;
+
+    if (!custom_menu)
+        return 0;
+
+    for (int i = 0; i < CUSTOM_MENU_MAX_ITEMS; i++)
+    {
+        struct menu_entry *slot = &custom_menu_placeholders[i];
+        if (slot->selected && slot->name && slot->parent_menu &&
+            slot->parent_menu != custom_menu)
+        {
+            snprintf(selected_menu, sizeof(selected_menu), "%s",
+                     slot->parent_menu->name);
+            snprintf(selected_entry, sizeof(selected_entry), "%s", slot->name);
+        }
+        custom_placeholder_clear(slot);
+        slot->selected = 0;
+    }
+
+    custom_menu->split_pos = -20;
+    for (struct menu *menu = menus; menu; menu = menu->next)
+    {
+        if (menu == custom_menu || menu->no_name_lookup)
+            continue;
+
+        for (struct menu_entry *entry = menu->children; entry; entry = entry->next)
+        {
+            if (!entry->starred || entry->shidden || MENU_IS_PLACEHOLDER(entry))
+                continue;
+            if (count >= CUSTOM_MENU_MAX_ITEMS)
+            {
+                /* Older MENUS.CFG files may contain more MyMenu stars. Slim
+                 * treats these as Custom marks and enforces the new limit. */
+                entry->starred = 0;
+                menu_flags_save_dirty = 1;
+                continue;
+            }
+
+            struct menu_entry *slot = &custom_menu_placeholders[count++];
+            dyn_menu_add_entry(custom_menu, entry, slot);
+            slot->starred = 1;
+            custom_entry_apply_movie_rules(slot);
+            if (selected_menu[0] && selected_entry[0] &&
+                streq(entry->parent_menu->name, selected_menu) &&
+                streq(entry->name, selected_entry))
+                slot->selected = 1;
+        }
+    }
+
+    if (!count)
+    {
+        struct menu_entry *slot = &custom_menu_placeholders[0];
+        custom_placeholder_clear(slot);
+        slot->name = "No Custom Items";
+        slot->shidden = 0;
+        slot->hidden = 0;
+        slot->jhidden = 0;
+        slot->update = custom_empty_update;
+    }
+    else
+    {
+        int have_selection = 0;
+        for (int i = 0; i < count; i++)
+            have_selection |= custom_menu_placeholders[i].selected;
+        if (!have_selection)
+            custom_menu_placeholders[0].selected = 1;
+    }
+
+    custom_menu_dirty = 0;
+    return count;
+}
+
+static int menu_custom_is_active(void)
+{
+    return custom_menu && custom_menu->selected &&
+           menu_grid_is_launched();
+}
+#endif
 
 /* hide menu items infrequently used (based on usage counters)
  * min_items:     if some menus end with too few items, move them to My Menu
@@ -3692,6 +3991,9 @@ menu_display(
     int only_selected
 )
 {
+#ifdef CONFIG_SLIM_MENUS
+    slim_touch_arrow_reset();
+#endif
     struct menu_entry * entry = menu->children;
     
     //hide upper menu for vscroll
@@ -4334,28 +4636,35 @@ show_vscroll(struct menu * parent){
 #ifdef CONFIG_SLIM_MENUS
         /* Match slim title bar (Canon height + pad) + gap below blue line. */
         int slim_header_h = (int)fontspec_font(FONT_CANON)->height + 20;
-        int far_right = menu_grid_is_launched() && !submenu_level;
+        int far_right = 1;
         int y_lo = far_right
             ? slim_header_h + 12 : 44;
         int h_bot = submenu_level ? 422 : (far_right ? 472 : 429);
-        int track_h = h_bot - y_lo;
+        /* Larger touch boxes than the visible arrows; top and bottom remain
+         * separated by the scrollbar track. */
+        int arrow_h = 34;
+        int track_y = y_lo + arrow_h;
+        int track_bottom = h_bot - arrow_h;
+        int track_h = MAX(1, track_bottom - track_y);
         int size = MAX(8, track_h * menu_len / max);
-        int y = y_lo + ((track_h - size) * (pos-1) / MAX(max-1, 1));
-        int x = far_right ? 716 : MIN(360 + g_submenu_width/2, 720-3);
-        int bar_w = far_right ? 2 : 3;
-        if (submenu_level) x -= 6;
+        int y = track_y + ((track_h - size) * (pos-1) / MAX(max-1, 1));
+        /* Keep the complete arrow inside the 720px bitmap edge. */
+        int x = 688;
+        int bar_w = 24;
 
-        /* Subtle track + thumb on the far right for grid Movie/etc. */
-        if (far_right)
-        {
-            bmp_fill(COLOR_GRAY(20), x, y_lo, bar_w, track_h);
-            bmp_fill(COLOR_GRAY(50), x, y, bar_w, size);
-        }
-        else
-        {
-            bmp_fill(COLOR_BLACK, x-2, y_lo, 6, track_h);
-            bmp_fill(MENU_BAR_COLOR, x, y, bar_w, size);
-        }
+        /* Minimal scrollbar: orange thumb and white Canon-style arrows only. */
+        bmp_fill(COLOR_ORANGE, x + 9, y, 6, size);
+        int arrow_size = MAX((int)fontspec_font(FONT_CANON)->height - 4, 18);
+        slim_draw_scroll_arrow_up(x + bar_w / 2, y_lo + arrow_size / 2 + 2,
+            arrow_size, COLOR_WHITE);
+        slim_draw_scroll_arrow_down(x + bar_w / 2, h_bot - arrow_size / 2 - 2,
+            arrow_size, COLOR_WHITE);
+        slim_touch_scroll_x1 = x;
+        slim_touch_scroll_x2 = x + bar_w;
+        slim_touch_scroll_up_y1 = y_lo;
+        slim_touch_scroll_up_y2 = track_y;
+        slim_touch_scroll_down_y1 = track_bottom;
+        slim_touch_scroll_down_y2 = h_bot;
 #else
         int y_lo = 44;
         int h = submenu_level ? 378 : 385;
@@ -4387,6 +4696,11 @@ void menus_display(
     
     if (mod_menu_dirty)
         mod_menu_rebuild();
+
+#ifdef CONFIG_SLIM_MENUS
+    if (custom_menu_dirty)
+        custom_menu_rebuild();
+#endif
 
 #ifdef CONFIG_SLIM_MENUS
     if (!menu_grid_is_active() && !menu_grid_is_launched())
@@ -4473,6 +4787,16 @@ void menus_display(
 
         /* Blue accent along the bottom edge of the grey bar */
         bmp_fill(MENU_BAR_COLOR, orig_x, y + header_h - 2, 720, 2);
+
+        /* Return-to-grid control in every launched category header. */
+        slim_draw_arrow_left(690, y + header_h / 2,
+            MAX((int)fontspec_font(FONT_CANON)->height - 4, 18), COLOR_WHITE);
+        /* EOS M touch X coordinates top out near 616; keep the visual arrow
+         * at the right while making its touch box reachable and generous. */
+        slim_touch_grid_back_x1 = 500;
+        slim_touch_grid_back_x2 = 718;
+        slim_touch_grid_back_y1 = y;
+        slim_touch_grid_back_y2 = y + header_h;
 
         content_y = header_h + 12;
     }
@@ -4799,6 +5123,12 @@ void menu_entry_select(
         return;
     }
 
+#ifdef CONFIG_SLIM_MENUS
+    /* Locked rows remain visible (with grey arrows) but cannot be adjusted. */
+    if (entry_is_slim_locked_grey(entry))
+        return;
+#endif
+
     /* note: entry->select() can delete itself (see e.g. file_man) */
     /* we must be careful to prevent using entry if this happened */
     /* fixme: better solution? */
@@ -4876,6 +5206,13 @@ void menu_entry_select(
         {
             entry_used = 1;
         }
+        else if (entry->name && streq(entry->name, "Anamorphic"))
+        {
+            /* The center value is intentionally inert to touch. SET is the
+             * single explicit OFF/restore control; arrows remain factors-only. */
+            anamorphic_preview_set_toggle();
+            entry_used = 1;
+        }
         else if (entry->edit_mode & EM_INLINE_ADJUST)
         {
             /* Dial-only value on this row. SET opens advanced submenu only. */
@@ -4886,7 +5223,7 @@ void menu_entry_select(
                 if (!submenu_level)
                     menu_toggle_submenu();
             }
-            /* No children (Monitoring ON/OFF etc.): SET does nothing. */
+            /* No children (Monitoring Off/Performance/Precision etc.): SET does nothing. */
             entry_used = 1;
         }
         else if (IS_BOOL(entry) && !entry->children)
@@ -4966,6 +5303,10 @@ void menu_entry_select(
         if (entry_used)
         {
             menu_update_usage_counters(entry);
+#ifdef CONFIG_SLIM_MENUS
+            /* Touch reopen uses this — remember the setting that was changed. */
+            menu_remember_selection(entry);
+#endif
         }
     }
 
@@ -5110,6 +5451,9 @@ void menu_entry_move(
 
     // Select the new one, which might be the same as the old one
     entry->selected = 1;
+#ifdef CONFIG_SLIM_MENUS
+    menu_remember_selection(entry);
+#endif
     
     if (!menu_lv_transparent_mode)
     {
@@ -5151,16 +5495,6 @@ static void menu_make_sure_selection_is_valid()
         menu_entry_move(menu, -1);
         menu_entry_move(menu, 1);
     }
-#ifdef CONFIG_SLIM_MENUS
-    else if (entry->selected && entry_is_slim_locked_grey(entry))
-    {
-        /* Mode change may have locked the current row — step to next adjustable. */
-        menu_entry_move(menu, 1);
-        entry = get_selected_menu_entry(menu);
-        if (entry && entry_is_slim_locked_grey(entry))
-            menu_entry_move(menu, -1);
-    }
-#endif
 }
 
 /*static void menu_select_current(int reverse)
@@ -5239,7 +5573,9 @@ menu_redraw_do()
             //~ prev_z = z;
             
 #ifdef CONFIG_SLIM_MENUS
-            if (menu_grid_is_active())
+            if (menu_quick_screen_is_active())
+                menu_quick_screen_draw();
+            else if (menu_grid_is_active())
                 menu_grid_draw();
             else
 #endif
@@ -5248,7 +5584,7 @@ menu_redraw_do()
             if (!menu_lv_transparent_mode && !SUBMENU_OR_EDIT && !junkie_mode)
             {
 #ifdef CONFIG_SLIM_MENUS
-                if (!menu_grid_is_active())
+                if (!menu_grid_is_active() && !menu_quick_screen_is_active())
 #endif
                 if (is_menu_active("Help")) menu_show_version();
             }
@@ -5575,6 +5911,54 @@ void keyrepeat_ack(int button_code) // also for arrow shortcuts
     keyrep_ack = (button_code == keyrepeat);
 }
 
+#ifdef CONFIG_SLIM_MENUS
+static int slim_touch_handle_menu_arrow(int x, int y)
+{
+    for (int i = 0; i < slim_touch_arrow_target_count; i++)
+    {
+        struct slim_touch_arrow_target *target = &slim_touch_arrow_targets[i];
+        if (x < target->x1 || x >= target->x2 ||
+            y < target->y1 || y >= target->y2)
+            continue;
+
+        if (target->entry && target->entry->parent_menu)
+        {
+            if (menu_custom_is_active())
+            {
+                for (struct menu_entry *entry = custom_menu->children;
+                     entry; entry = entry->next)
+                    entry->selected = (entry == target->entry);
+            }
+            else
+            {
+                select_menu_by_name(target->entry->parent_menu->name,
+                    target->entry->name);
+            }
+            if (target->mode >= 0 &&
+                !entry_is_slim_locked_grey(target->entry))
+                menu_entry_select(get_current_menu_or_submenu(), target->mode);
+            menu_redraw();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void slim_draw_scroll_arrow_up(int cx, int cy, int size, int color)
+{
+    int depth = MAX((size * 6) / 10, 2);
+    bmp_draw_antialiased_triangle(cx, cy - MAX(size / 2, 1), 2,
+        depth, MAX(size / 2, 1), color);
+}
+
+static void slim_draw_scroll_arrow_down(int cx, int cy, int size, int color)
+{
+    int depth = MAX((size * 6) / 10, 2);
+    bmp_draw_antialiased_triangle(cx, cy + MAX(size / 2, 1), 3,
+        depth, MAX(size / 2, 1), color);
+}
+#endif
+
 #ifdef CONFIG_TOUCHSCREEN
 int handle_ml_menu_touch(struct event * event)
 {
@@ -5582,7 +5966,37 @@ int handle_ml_menu_touch(struct event * event)
     switch (button_code) {
         case BGMT_TOUCH_1_FINGER:
 #ifdef CONFIG_SLIM_MENUS
-            /* Slim: no touch interaction on any menu item. */
+            if (menu_quick_screen_is_active())
+            {
+                int x, y;
+                if (eosm_touch_get_xy(event, &x, &y) == 1)
+                    menu_quick_screen_handle_touch(x, y);
+            }
+            else if (menu_grid_is_active())
+            {
+                int x, y;
+                if (eosm_touch_get_xy(event, &x, &y) == 1 &&
+                    menu_grid_handle_touch(x, y) == 0)
+                {
+                    menu_redraw();
+                }
+            }
+#ifdef CONFIG_SLIM_MENUS
+            else
+            {
+                int x, y;
+                if (eosm_touch_get_xy(event, &x, &y) == 1)
+                {
+                    if (!slim_touch_handle_grid_back(x, y))
+                    {
+                        /* Header arrow returned to the launcher. */
+                    }
+                    else if (slim_touch_handle_scroll(x, y, 1))
+                        slim_touch_handle_menu_arrow(x, y);
+                }
+            }
+#endif
+            /* Touch arrows use the same menu selection path as physical keys. */
             return 0;
 #else
             fake_simple_button(BGMT_Q);
@@ -5590,17 +6004,205 @@ int handle_ml_menu_touch(struct event * event)
 #endif
         case BGMT_TOUCH_2_FINGER:
 #ifdef CONFIG_SLIM_MENUS
+            if (menu_quick_screen_is_active())
+                return 0;
+            slim_touch_scroll_cancel();
             return 0;
 #else
             fake_simple_button(BGMT_TRASH);
             return 0;
 #endif
+#ifdef BGMT_TOUCH_MOVE
+        case BGMT_TOUCH_MOVE:
+#ifdef CONFIG_SLIM_MENUS
+            if (menu_quick_screen_is_active())
+            {
+                int x, y;
+                if (eosm_touch_get_xy(event, &x, &y) == 1)
+                    menu_quick_screen_handle_touch(x, y);
+                return 0;
+            }
+#endif
+            return 1;
+#endif
         case BGMT_UNTOUCH_1_FINGER:
         case BGMT_UNTOUCH_2_FINGER:
+#ifdef CONFIG_SLIM_MENUS
+            if (menu_quick_screen_is_active())
+            {
+                menu_quick_screen_touch_release();
+                return 0;
+            }
+            slim_touch_handle_scroll(0, 0, 0);
+#endif
             return 0;
         default:
             return 1;
     }
+    return 1;
+}
+
+static void slim_touch_scroll_move(int direction)
+{
+    /* Re-inject the normal menu button event. Directly moving the menu from
+     * the touch/timer callback can race the menu task and trigger Canon Err 70. */
+    /* Wheel events are one-shot; PRESS_UP/DOWN would arm ML key-repeat
+     * because touch has no matching physical unpress event. */
+    fake_simple_button(direction < 0 ? BGMT_WHEEL_UP : BGMT_WHEEL_DOWN);
+}
+
+static void slim_touch_scroll_repeat(int timer, void *opaque)
+{
+    (void)timer;
+    (void)opaque;
+    if (!slim_touch_scroll_pressed || !menu_shown)
+        return;
+    slim_touch_scroll_move(slim_touch_scroll_direction);
+    if (slim_touch_scroll_repeat_ms > 35)
+        slim_touch_scroll_repeat_ms -= 15;
+    delayed_call(slim_touch_scroll_repeat_ms, slim_touch_scroll_repeat, 0);
+}
+
+static int slim_touch_handle_scroll(int x, int y, int pressed)
+{
+    if (!pressed)
+    {
+        slim_touch_scroll_pressed = 0;
+        return 0;
+    }
+
+    if (!slim_touch_scroll_x2 || x < slim_touch_scroll_x1 || x >= slim_touch_scroll_x2)
+        return 1;
+
+    if (y >= slim_touch_scroll_up_y1 && y < slim_touch_scroll_up_y2)
+        slim_touch_scroll_direction = -1;
+    else if (y >= slim_touch_scroll_down_y1 && y < slim_touch_scroll_down_y2)
+        slim_touch_scroll_direction = 1;
+    else
+        return 1;
+
+    slim_touch_scroll_pressed = 1;
+    slim_touch_scroll_repeat_ms = 220;
+    slim_touch_scroll_move(slim_touch_scroll_direction);
+    delayed_call(slim_touch_scroll_repeat_ms, slim_touch_scroll_repeat, 0);
+    return 0;
+}
+
+static int slim_touch_handle_grid_back(int x, int y)
+{
+    if (!slim_touch_grid_back_x2 || x < slim_touch_grid_back_x1 ||
+        x >= slim_touch_grid_back_x2 || y < slim_touch_grid_back_y1 ||
+        y >= slim_touch_grid_back_y2)
+        return 1;
+    if (menu_custom_is_active())
+        gui_stop_menu();
+    else
+    {
+        menu_grid_return();
+        menu_redraw();
+    }
+    return 0;
+}
+
+void slim_touch_scroll_cancel(void)
+{
+    slim_touch_scroll_pressed = 0;
+}
+#endif
+
+#ifdef CONFIG_SLIM_MENUS
+static int custom_set_hold_pressed;
+static int custom_set_hold_fired;
+static unsigned custom_set_hold_serial;
+
+static int custom_marked_count(void)
+{
+    int count = 0;
+    for (struct menu *menu = menus; menu; menu = menu->next)
+    {
+        if (menu == custom_menu || menu->no_name_lookup)
+            continue;
+        for (struct menu_entry *entry = menu->children; entry; entry = entry->next)
+            if (entry->starred && !entry->shidden && !MENU_IS_PLACEHOLDER(entry))
+                count++;
+    }
+    return count;
+}
+
+static struct menu_entry *custom_original_entry(struct menu_entry *entry)
+{
+    if (!entry || !entry->name || !entry->parent_menu ||
+        entry->parent_menu == custom_menu || entry->parent_menu->no_name_lookup ||
+        MENU_IS_PLACEHOLDER(entry))
+        return 0;
+
+    if (menu_custom_is_active())
+        return entry_find_by_name(entry->parent_menu->name, entry->name);
+    return entry;
+}
+
+static void custom_toggle_selected_entry(void)
+{
+    struct menu_entry *shown =
+        get_selected_menu_entry(get_current_menu_or_submenu());
+    struct menu_entry *entry = custom_original_entry(shown);
+    if (!entry)
+        return;
+
+    if (!entry->starred && custom_marked_count() >= CUSTOM_MENU_MAX_ITEMS)
+    {
+        beep();
+        return;
+    }
+
+    entry->starred = !entry->starred;
+    menu_flags_save_dirty = 1;
+    custom_menu_dirty = 1;
+    menu_redraw_full();
+}
+
+static void custom_set_hold_fire(int timer, void *opaque)
+{
+    (void)timer;
+    unsigned serial = (unsigned)(uintptr_t)opaque;
+    if (!custom_set_hold_pressed || custom_set_hold_fired ||
+        serial != custom_set_hold_serial || !gui_menu_shown())
+        return;
+
+    custom_set_hold_fired = 1;
+    fake_simple_button(MLEV_CUSTOM_MARK_LONG);
+}
+
+static int custom_handle_set_hold(struct event *event)
+{
+    if (event->param == MLEV_CUSTOM_MARK_LONG)
+    {
+        custom_toggle_selected_entry();
+        return 0;
+    }
+
+    if (event->param == BGMT_PRESS_SET && !IS_FAKE(event) &&
+        !menu_grid_is_active() && !menu_quick_screen_is_active() &&
+        !menu_custom_is_active())
+    {
+        custom_set_hold_pressed = 1;
+        custom_set_hold_fired = 0;
+        custom_set_hold_serial++;
+        delayed_call(1000, custom_set_hold_fire,
+                     (void *)(uintptr_t)custom_set_hold_serial);
+        return 0;
+    }
+
+    if (event->param == BGMT_UNPRESS_SET && custom_set_hold_pressed)
+    {
+        int was_long = custom_set_hold_fired;
+        custom_set_hold_pressed = 0;
+        custom_set_hold_serial++;
+        if (!was_long)
+            fake_simple_button(BGMT_PRESS_SET);
+        return 0;
+    }
+
     return 1;
 }
 #endif
@@ -5614,6 +6216,26 @@ handle_ml_menu_keys(struct event * event)
     if (!menu_shown) return 1;
     if (!DISPLAY_IS_ON)
         if (event->param != BGMT_PRESS_HALFSHUTTER) return 1;
+
+#if defined(CONFIG_SLIM_MENUS) && defined(CONFIG_TOUCHSCREEN)
+    /* Quick Screen is a first-class menu screen. Route its touch lifecycle
+     * before the generic key guard, which intentionally swallows unrelated
+     * menu keys and would otherwise consume touch events too. */
+    if (menu_quick_screen_is_active())
+    {
+        switch (event->param)
+        {
+        case BGMT_TOUCH_1_FINGER:
+        case BGMT_TOUCH_2_FINGER:
+        case BGMT_UNTOUCH_1_FINGER:
+        case BGMT_UNTOUCH_2_FINGER:
+#ifdef BGMT_TOUCH_MOVE
+        case BGMT_TOUCH_MOVE:
+#endif
+            return handle_ml_menu_touch(event);
+        }
+    }
+#endif
 
     // on some cameras, scroll events may arrive grouped; we can't handle it, so split into individual events
     if (handle_scrollwheel_fast_clicks(event)==0) return 0;
@@ -5658,6 +6280,19 @@ handle_ml_menu_keys(struct event * event)
     int menu_needs_full_redraw = 0; // if true, do not allow quick redraws
 
 #ifdef CONFIG_SLIM_MENUS
+    if (!custom_handle_set_hold(event))
+        return 0;
+#endif
+
+#ifdef CONFIG_SLIM_MENUS
+    if (menu_quick_screen_is_active())
+    {
+        if (!menu_quick_screen_handle_key(button_code))
+        {
+            keyrepeat_ack(button_code);
+            return 0;
+        }
+    }
     if (menu_grid_is_active())
     {
         int grid_handled = menu_grid_handle_key(button_code, &menu_needs_full_redraw);
@@ -5676,6 +6311,11 @@ handle_ml_menu_keys(struct event * event)
     case BGMT_MENU:
     {
 #ifdef CONFIG_SLIM_MENUS
+        if (menu_custom_is_active())
+        {
+            gui_stop_menu();
+            return 0;
+        }
         if (menu_grid_is_active())
         {
             give_semaphore(gui_sem);
@@ -5915,6 +6555,9 @@ handle_ml_menu_keys(struct event * event)
     case BGMT_TOUCH_2_FINGER:
     case BGMT_UNTOUCH_1_FINGER:
     case BGMT_UNTOUCH_2_FINGER:
+#ifdef BGMT_TOUCH_MOVE
+    case BGMT_TOUCH_MOVE:
+#endif
         return handle_ml_menu_touch(event);
 #endif
 
@@ -5960,7 +6603,11 @@ handle_ml_menu_keys(struct event * event)
     if (menu_needs_full_redraw) menu_redraw_full();
     else menu_redraw();
     keyrepeat_ack(button_code);
+#ifdef CONFIG_SLIM_MENUS
+    hist_countdown = monitoring_hist_menu_countdown();
+#else
     hist_countdown = 3;
+#endif
     return 0;
 }
 
@@ -5985,6 +6632,10 @@ menu_init( void )
     menu_find_by_name( "Display",   ICON_ML_DISPLAY );
 #ifdef CONFIG_SLIM_MENUS
     menu_find_by_name( "Settings",  ICON_ML_PREFS   );
+    custom_menu = menu_find_by_name(CUSTOM_MENU_NAME, ICON_ML_MYMENU);
+    menu_add(CUSTOM_MENU_NAME, custom_menu_placeholders,
+             COUNT(custom_menu_placeholders));
+    custom_menu->no_name_lookup = 1;
 #else
     menu_find_by_name( "Prefs",     ICON_ML_PREFS   );
 #endif
@@ -6042,8 +6693,135 @@ void
 gui_open_menu( )
 {
     if (!gui_menu_shown())
+    {
         give_semaphore(gui_sem);
+    }
 }
+
+#ifdef CONFIG_SLIM_MENUS
+static void menu_last_sel_path(char * path, unsigned n)
+{
+    snprintf(path, n, "%sLASTSEL.CFG", get_config_dir());
+}
+
+static void menu_last_sel_load(void)
+{
+    char path[64];
+    menu_last_sel_path(path, sizeof(path));
+    FILE * f = FIO_OpenFile(path, O_RDONLY | O_SYNC);
+    if (!f) return;
+    char buf[96];
+    int n = FIO_ReadFile(f, buf, sizeof(buf) - 1);
+    FIO_CloseFile(f);
+    if (n <= 0) return;
+    buf[n] = 0;
+    char * nl = strchr(buf, '\n');
+    if (!nl) return;
+    *nl = 0;
+    char * entry = nl + 1;
+    char * nl2 = strchr(entry, '\n');
+    if (nl2) *nl2 = 0;
+    if (!buf[0] || !entry[0]) return;
+    snprintf(last_sel_menu, sizeof(last_sel_menu), "%s", buf);
+    snprintf(last_sel_entry, sizeof(last_sel_entry), "%s", entry);
+}
+
+static void menu_last_sel_save(void)
+{
+    if (!last_sel_dirty || !last_sel_menu[0] || !last_sel_entry[0])
+        return;
+    char path[64];
+    menu_last_sel_path(path, sizeof(path));
+    FILE * f = FIO_CreateFile(path);
+    if (!f) return;
+    my_fprintf(f, "%s\n%s\n", last_sel_menu, last_sel_entry);
+    FIO_CloseFile(f);
+    last_sel_dirty = 0;
+}
+
+void menu_remember_selection(struct menu_entry * entry)
+{
+    if (!entry || !entry->name || !entry->name[0])
+        return;
+    if (!entry->parent_menu || !entry->parent_menu->name || !entry->parent_menu->name[0])
+        return;
+    if (entry->parent_menu->no_name_lookup)
+        return;
+
+    if (streq(last_sel_menu, entry->parent_menu->name) &&
+        streq(last_sel_entry, entry->name))
+        return;
+
+    snprintf(last_sel_menu, sizeof(last_sel_menu), "%s", entry->parent_menu->name);
+    snprintf(last_sel_entry, sizeof(last_sel_entry), "%s", entry->name);
+    last_sel_dirty = 1;
+}
+
+void gui_open_menu_at_entry(const char * menu_name, const char * entry_name)
+{
+    if (!menu_name || !menu_name[0] || !entry_name || !entry_name[0])
+        return;
+
+    snprintf(menu_open_target_menu, sizeof(menu_open_target_menu), "%s", menu_name);
+    snprintf(menu_open_target_entry, sizeof(menu_open_target_entry), "%s", entry_name);
+    menu_open_direct = 1;
+
+    if (gui_menu_shown())
+    {
+        select_menu_by_name(menu_open_target_menu, menu_open_target_entry);
+        menu_grid_enter_launched();
+        menu_open_direct = 0;
+        menu_redraw_full();
+        return;
+    }
+
+    give_semaphore(gui_sem);
+}
+
+void gui_open_last_menu_selection(void)
+{
+    if (last_sel_menu[0] && last_sel_entry[0])
+        gui_open_menu_at_entry(last_sel_menu, last_sel_entry);
+    else
+        gui_open_menu_at_entry("Movie", "Mode");
+}
+
+void gui_open_custom_menu(void)
+{
+    const char *entry_name = "No Custom Items";
+
+    custom_menu_dirty = 1;
+    custom_menu_rebuild();
+    for (int i = 0; i < CUSTOM_MENU_MAX_ITEMS; i++)
+    {
+        if (custom_menu_placeholders[i].selected &&
+            !custom_menu_placeholders[i].shidden)
+        {
+            entry_name = custom_menu_placeholders[i].name;
+            break;
+        }
+    }
+
+    snprintf(menu_open_target_menu, sizeof(menu_open_target_menu), "%s",
+             CUSTOM_MENU_NAME);
+    snprintf(menu_open_target_entry, sizeof(menu_open_target_entry), "%s",
+             entry_name);
+    menu_open_direct = 1;
+
+    if (gui_menu_shown())
+    {
+        /* Rebuild already restored the exact slot, including duplicate names
+         * originating from different menus. Select only the top-level page. */
+        select_menu_by_name(menu_open_target_menu, 0);
+        menu_grid_enter_launched();
+        menu_open_direct = 0;
+        menu_redraw_full();
+        return;
+    }
+
+    give_semaphore(gui_sem);
+}
+#endif
 
 int FAST
 gui_menu_shown( void )
@@ -6071,15 +6849,17 @@ void menu_redraw_flood()
 {
     if (!lv) msleep(100);
     else if (EXT_MONITOR_CONNECTED) msleep(300);
-    for (int i = 0; i < 5; i++)
+    /* Keep Canon's front buffer masked for the complete transition.  Enabling
+     * it here exposed one Canon exposure-compensation frame immediately
+     * before Quick Panel/grid became visible. */
+    for (int i = 0; i < 3; i++)
     {
         if (redraw_flood_stop) break;
         if (!menu_shown) break;
-        canon_gui_enable_front_buffer(0);
         menu_redraw_full();
-        msleep(20);
+        msleep(10);
     }
-    msleep(50);
+    msleep(20);
     redraw_flood_stop = 1;
 }
 
@@ -6103,9 +6883,14 @@ static void piggyback_canon_menu()
     NotifyBoxHide();
     if (new_gui_mode != (int)CURRENT_GUI_MODE) 
     { 
+        /* Hide Canon's front buffer before changing GUI mode.  Previously the
+         * mask was applied after a 200 ms wait, allowing one Canon frame to
+         * flash through when Quick Panel/grid opened from Live View. */
+        if (lv)
+            canon_gui_disable_front_buffer(0);
         start_redraw_flood();
         if (lv) bmp_off(); // mask out the underlying Canon menu :)
-        SetGUIRequestMode(new_gui_mode); msleep(200); 
+        SetGUIRequestMode(new_gui_mode);
         // bmp will be enabled after first redraw
     }
 #endif
@@ -6134,6 +6919,13 @@ static void menu_open()
 { 
     if (menu_shown) return;
 
+#ifdef CONFIG_SLIM_MENUS
+    /* WINSYS/BMP locking is unsafe from the delayed touch resolver and caused
+     * EOS M ERR70. The menu task owns the transition, so suppress Canon here,
+     * before changing any Quick Panel/grid state or Canon GUI mode. */
+    if (lv) canon_gui_disable_front_buffer();
+#endif
+
     
     // start in my menu, if configured
     /*
@@ -6160,7 +6952,21 @@ static void menu_open()
     menu_shown = 1;
     //~ menu_hidden_should_display_help = 0;
 #ifdef CONFIG_SLIM_MENUS
-    menu_grid_open();
+    if (menu_open_direct)
+    {
+        if (streq(menu_open_target_menu, CUSTOM_MENU_NAME))
+            select_menu_by_name(menu_open_target_menu, 0);
+        else
+            select_menu_by_name(menu_open_target_menu, menu_open_target_entry);
+        menu_grid_enter_launched();
+        menu_open_direct = 0;
+        if (!menu_custom_is_active())
+            menu_remember_selection(get_selected_menu_entry(get_current_menu_or_submenu()));
+    }
+    else
+    {
+        menu_grid_open();
+    }
 #endif
     if (lv) menu_zebras_mirror_dirty = 1;
 
@@ -6178,6 +6984,11 @@ static void menu_close()
     menu_shown = false;
 
 #ifdef CONFIG_SLIM_MENUS
+    menu_last_sel_save();
+    /* A Quick Panel opened by touch may be dismissed by MENU, Q,
+     * half-shutter or an automatic menu close. Never let that screen state
+     * leak into the next Down-button launch of the grid. */
+    menu_quick_screen_close();
     menu_grid_close();
 #endif
     customize_mode = 0;
@@ -6213,10 +7024,16 @@ static void
 menu_task( void* unused )
 {
     extern int ml_started;
-    while (!ml_started) msleep(100);
+    /* Poll startup readiness frequently so the first user touch/dial event
+     * does not wait an extra 100 ms for the menu task to wake. */
+    while (!ml_started) msleep(10);
+    
+#ifdef CONFIG_SLIM_MENUS
+    menu_last_sel_load();
+#endif
 
     debug_menu_init();
-
+    
     int initial_mode = 0; // shooting mode when menu was opened (if changed, menu should close)
     
     TASK_LOOP
@@ -6450,6 +7267,47 @@ void select_menu_recursive(struct menu * selected_menu, const char * entry_name)
         }
     }
 }
+
+#ifdef CONFIG_SLIM_MENUS
+static void menu_select_first_visible_entry(struct menu * menu)
+{
+    if (!menu)
+        return;
+
+    for (struct menu_entry * entry = menu->children; entry; entry = entry->next)
+        entry->selected = 0;
+
+    for (struct menu_entry * entry = menu->children; entry; entry = entry->next)
+    {
+        if (entry_is_slim_navigable(entry))
+        {
+            entry->selected = 1;
+            caret_position = entry->unit == UNIT_TIME ? 1 : 0;
+            break;
+        }
+    }
+
+    menu->scroll_pos = 0;
+}
+
+EXCLUDES(menu_sem)
+void menu_select_first_entry(char* name)
+{
+    take_semaphore(menu_sem, 0);
+
+    for (struct menu * menu = menus; menu; menu = menu->next)
+    {
+        if (streq(menu->name, name))
+        {
+            menu_select_first_visible_entry(menu);
+            /* Do not remember here — would overwrite last changed setting. */
+            break;
+        }
+    }
+
+    give_semaphore(menu_sem);
+}
+#endif
 
 EXCLUDES(menu_sem)
 void select_menu_by_name(char* name, const char* entry_name)
@@ -6704,6 +7562,16 @@ static struct longpress erase_longpress = {
     .pos_x = 670,   /* in LiveView */
     .pos_y = 343,   /* above ExpSim */
 };
+
+#ifdef CONFIG_SLIM_MENUS
+static struct longpress custom_up_longpress = {
+    .long_btn_press     = MLEV_CUSTOM_MENU_LONG,
+    .short_btn_press    = BGMT_PRESS_UP,
+    .short_btn_unpress  = BGMT_UNPRESS_UP,
+    .pos_x = 670,
+    .pos_y = 343,
+};
+#endif
 #endif
 
 #ifdef BGMT_Q_SET
@@ -6721,6 +7589,15 @@ static struct longpress qset_longpress = {
 int handle_ml_menu_erase(struct event * event)
 {
     if (dofpreview) return 1; // don't open menu when DOF preview is locked
+
+#if defined(CONFIG_EOSM) && defined(CONFIG_SLIM_MENUS)
+    if (event->param == MLEV_CUSTOM_MENU_LONG)
+    {
+        if (!gui_menu_shown() && lv && is_movie_mode() && !RECORDING)
+            gui_open_custom_menu();
+        return 0;
+    }
+#endif
     
     if (event->param == BGMT_TRASH ||
         #if defined(CONFIG_EOSM) && !defined(CONFIG_SLIM_MENUS)
@@ -6859,8 +7736,38 @@ int handle_longpress_events(struct event * event)
     }
     else if (event->param == BGMT_UNPRESS_DOWN)
     {
+        int routed_by_longpress = erase_longpress.pressed;
         erase_longpress.pressed = 0;
+        /* The physical DOWN press was swallowed and the long-press router
+         * emits a complete synthetic short/long action. Do not leak the lone
+         * physical release to Canon; it can redraw the exposure GUI for one
+         * frame while the ML grid is opening. */
+        if (routed_by_longpress)
+            return 0;
     }
+
+
+#ifdef CONFIG_SLIM_MENUS
+    /* UP mirrors the existing EOS M DOWN long-press router, including its
+     * expanding-circle feedback. A short UP is re-injected unchanged. */
+    if (event->param == BGMT_PRESS_UP)
+    {
+        if (!gui_menu_shown() && !IS_FAKE(event))
+        {
+            custom_up_longpress.pressed = 1;
+            custom_up_longpress.count = 0;
+            delayed_call(20, longpress_check, &custom_up_longpress);
+            return 0;
+        }
+    }
+    else if (event->param == BGMT_UNPRESS_UP)
+    {
+        int routed_by_longpress = custom_up_longpress.pressed;
+        custom_up_longpress.pressed = 0;
+        if (routed_by_longpress)
+            return 0;
+    }
+#endif
 #endif
 
 /* probably not the best place to implement this but let us avoid dirty hacks for now  */
@@ -7150,6 +8057,9 @@ static void config_menu_reload_flags()
     snprintf(menu_config_file, sizeof(menu_config_file), "%sMENUS.CFG", get_config_dir());
     menu_reload_flags(menu_config_file);
     my_menu_dirty = 1;
+#ifdef CONFIG_SLIM_MENUS
+    custom_menu_dirty = 1;
+#endif
 }
 
 void config_menu_save_flags()
@@ -7226,6 +8136,51 @@ char* menu_get_str_value_from_script(const char* name, const char* entry_name, s
     char* ans = menu_get_str_value_from_script_do(name, entry_name, info);
     give_semaphore(menu_sem);
     return ans;
+}
+
+/* Adjust a normal menu entry through its existing selector while a custom
+ * screen is visible. This keeps one source of truth for allowed values,
+ * clamping and hardware updates. */
+int menu_adjust_value_by_name(const char* name, const char* entry_name, int delta)
+{
+    struct menu_entry * entry = entry_find_by_name(name, entry_name);
+    if (!entry)
+        return 0;
+
+    /* Do not select the hidden backing menu: on placeholder-driven menus that
+     * can select the placeholder row rather than the module's real entry.
+     * Invoke the resolved entry's normal selector directly instead. */
+    ASSERT(entry_being_updated == 0);
+    entry_being_updated = entry;
+    entry_removed_itself = 0;
+
+    if (entry->select)
+    {
+        entry->select(entry->priv, delta);
+    }
+    else if (IS_ML_PTR(entry->priv))
+    {
+        menu_numeric_toggle_fast(
+            entry->priv, delta, entry->min, entry->max,
+            entry->unit, entry->edit_mode, 0);
+    }
+    else
+    {
+        entry_being_updated = 0;
+        return 0;
+    }
+
+    entry_being_updated = 0;
+    if (!entry_removed_itself)
+    {
+        menu_update_usage_counters(entry);
+#ifdef CONFIG_SLIM_MENUS
+        menu_remember_selection(entry);
+#endif
+    }
+    config_dirty = 1;
+    mod_menu_dirty = 1;
+    return 1;
 }
 
 EXCLUDES(menu_sem)

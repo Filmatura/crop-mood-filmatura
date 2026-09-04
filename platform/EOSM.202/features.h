@@ -39,6 +39,8 @@
 /* False color: needed for Settings → INFO Button → false colors toggle. */
 #define FEATURE_FALSE_COLOR
 #define FEATURE_WAVEFORM
+/* Slim Settings exposes the existing display-filter anamorphic preview. */
+#define FEATURE_ANAMORPHIC_PREVIEW
 #undef FEATURE_VECTORSCOPE
 #undef FEATURE_REC_NOTIFY
 

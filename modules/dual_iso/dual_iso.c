@@ -90,6 +90,8 @@ extern WEAK_FUNC(ret_0) float raw_to_ev(int ev);
 
 int dual_iso_set_enabled(bool enabled);
 int dual_iso_is_enabled();
+int dual_iso_slim_step_pair(int delta);
+int dual_iso_slim_step_recovery(int delta);
 int dual_iso_is_active();
 
 /* camera-specific constants */
@@ -724,6 +726,119 @@ static void slim_dual_sync_primary(int primary)
         return;
 
     slim_dual_set_cycle_pos(primary, 1);
+}
+
+/* Recording-screen UP/DOWN (ISO arrows): step primary + recovery together.
+ * 100/200 -> 200/400 -> 400/800 -> 800/1600; clamp at ends. Dual ISO must be ON. */
+int dual_iso_slim_step_pair(int delta)
+{
+    static const int primaries[] = { 100, 200, 400, 800 };
+    static const int recoveries[] = { 200, 400, 800, 1600 };
+    static const int primary_raw[] = { 72, 80, 88, 96 };
+
+    if (!isoless_hdr || delta == 0)
+        return 0;
+
+    /* Match bottom-bar display (lens.c iso_update): analog ISO, full stops. */
+    int primary = lens_info.iso_analog_raw
+        ? raw2iso(lens_info.iso_analog_raw / 8 * 8)
+        : slim_dual_primary_iso();
+    int idx = -1;
+
+    for (unsigned i = 0; i < COUNT(primaries); i++)
+    {
+        if (primary == primaries[i])
+        {
+            idx = (int)i;
+            break;
+        }
+    }
+
+    if (idx < 0)
+    {
+        /* Misaligned (e.g. primary moved without recovery) — anchor from primary. */
+        for (unsigned i = 0; i < COUNT(primaries); i++)
+        {
+            if (primary <= primaries[i])
+            {
+                idx = (int)i;
+                break;
+            }
+        }
+        if (idx < 0)
+            idx = COUNT(primaries) - 1;
+    }
+
+    int new_idx = idx + (delta > 0 ? 1 : -1);
+    if (new_idx < 0 || new_idx >= (int)COUNT(primaries))
+        return 0;
+
+    if (!lens_set_rawiso(primary_raw[new_idx]))
+        return 0;
+
+    isoless_hdr = 1;
+    isoless_recovery_iso = slim_dual_rec_to_index(recoveries[new_idx]);
+    isoless_refresh(CTX_SET_RECOVERY_ISO);
+    lens_display_set_dirty();
+    return 1;
+}
+
+/* Live View's ISO editor controls recovery ISO while Dual ISO is enabled.
+ * Keep the primary ISO untouched and only offer a full-stop recovery value
+ * strictly above it.  This also repairs an old/invalid saved recovery value
+ * before the next recording starts. */
+int dual_iso_slim_step_recovery(int delta)
+{
+    int primary;
+    int current;
+    int current_pos = -1;
+    int valid_count = 0;
+    int new_pos;
+
+    if (!isoless_hdr || delta == 0)
+        return 0;
+
+    primary = lens_info.iso_analog_raw
+        ? raw2iso(lens_info.iso_analog_raw / 8 * 8)
+        : slim_dual_primary_iso();
+    current = raw2iso(72 + isoless_recovery_iso_index() * 8);
+
+    for (unsigned i = 0; i < COUNT(slim_dual_recs); i++)
+    {
+        if (slim_dual_recs[i] <= primary)
+            continue;
+        if (slim_dual_recs[i] == current)
+            current_pos = valid_count;
+        valid_count++;
+    }
+
+    if (!valid_count)
+        return 0;
+
+    /* A recovery ISO at or below base ISO is invalid: restore the lowest
+     * usable recovery ISO instead of exposing it in the editor. */
+    if (current_pos < 0)
+        new_pos = 0;
+    else
+        new_pos = COERCE(current_pos + (delta > 0 ? 1 : -1),
+                         0, valid_count - 1);
+
+    int pos = 0;
+    for (unsigned i = 0; i < COUNT(slim_dual_recs); i++)
+    {
+        if (slim_dual_recs[i] <= primary)
+            continue;
+        if (pos++ != new_pos)
+            continue;
+
+        isoless_hdr = 1;
+        isoless_recovery_iso = slim_dual_rec_to_index(slim_dual_recs[i]);
+        isoless_refresh(CTX_SET_RECOVERY_ISO);
+        lens_display_set_dirty();
+        return 1;
+    }
+
+    return 0;
 }
 
 static MENU_UPDATE_FUNC(isoless_update)

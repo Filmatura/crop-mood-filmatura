@@ -12,6 +12,8 @@ struct boot_logo_span { uint16_t y; uint16_t x; uint16_t width; uint8_t color; }
 #include "boot-logo-spans-filmatura.inc"
 #include "boot-logo-spans-revo.inc"
 #include "boot-logo-spans-rogue.inc"
+#include "boot-logo-spans-magiclantern.inc"
+#include "boot-logo-spans-mlite.inc"
 
 struct boot_logo_set { const struct boot_logo_span *spans; int count; };
 
@@ -20,8 +22,15 @@ static const struct boot_logo_set boot_logo_sets[] = {
     LOGO_SET(boot_logo_spans_filmatura),
     LOGO_SET(boot_logo_spans_revo),
     LOGO_SET(boot_logo_spans_rogue),
+    LOGO_SET(boot_logo_spans_magiclantern),
+    LOGO_SET(boot_logo_spans_mlite),
 };
-#define BOOT_LOGO_COUNT (sizeof(boot_logo_sets) / sizeof(boot_logo_sets[0]))
+#define BOOT_LOGO_SET_COUNT (sizeof(boot_logo_sets) / sizeof(boot_logo_sets[0]))
+
+/* "Custom" isn't a spans set -- it's loaded from card at draw time -- so it
+ * gets one extra index past the end of boot_logo_sets[]. */
+#define BOOT_LOGO_CUSTOM_INDEX BOOT_LOGO_SET_COUNT
+#define BOOT_LOGO_COUNT (BOOT_LOGO_SET_COUNT + 1)
 
 /* Shown in Prefs; also persisted (see below) since boot_logo_show() runs
  * before config_load(), so this variable's value isn't loaded from the
@@ -69,8 +78,11 @@ static struct menu_entry boot_logo_menu[] = {
         .priv = &boot_logo_choice,
         .max = BOOT_LOGO_COUNT - 1,
         .select = boot_logo_toggle,
-        .choices = CHOICES("Filmatura", "REVO", "Rogue"),
+        .choices = CHOICES("Filmatura", "REVO", "Rogue", "Magic Lantern", "M-Lite", "Custom"),
         .help = "Logo shown while the camera boots.",
+        .help2 = "Custom: loads \\BOOTLOGO.BMP from the card root (720x480).\n"
+                 "Use the installer to prep your own image -- it picks style\n"
+                 "and does the color work on the PC, camera just displays it.",
     },
 };
 
@@ -95,11 +107,129 @@ extern int ml_started;
 
 static int boot_logo_selected = 0;
 
+/* Custom boot logo: a user-supplied 720x480, 24-bit uncompressed BMP at the
+ * card root. Not a PNG -- decoding PNG needs a DEFLATE/zlib implementation,
+ * which this firmware doesn't carry and isn't a safe thing to add for a
+ * splash screen. Uncompressed BMP is just a fixed 54-byte header followed by
+ * raw pixel bytes, so it can be parsed and streamed straight off the card
+ * with no decompression at all.
+ *
+ * The BMP OSD hardware only has a 16-color palette; ML's higher color
+ * indices (COLOR_GRAY(0..100) = indices 38-79) reuse a pre-existing 42-step
+ * grayscale ramp from Canon's own palette instead. That's plenty to render
+ * a real photo recognizably, so custom logos are shown in grayscale rather
+ * than trying to build/load a custom color palette. */
+#define BOOT_LOGO_CUSTOM_FILE "BOOTLOGO.BMP"
+#define BOOT_LOGO_CUSTOM_W 720
+#define BOOT_LOGO_CUSTOM_H 480
+
+/* A batch of pixel rows, read in one FIO_ReadFile call rather than one call
+ * per row -- 480 tiny sequential reads this early in boot (before the card
+ * is necessarily up to full transfer speed) was slow enough to blow past
+ * the splash's display budget. Too big for boot_logo_task's small stack
+ * (see task_create below), so it's static instead. */
+#define BOOT_LOGO_CUSTOM_ROWS_PER_READ 16
+static uint8_t boot_logo_custom_rows[BOOT_LOGO_CUSTOM_W * 3 * BOOT_LOGO_CUSTOM_ROWS_PER_READ];
+
+/* Returns 1 if a valid file was found and fully drawn, 0 otherwise (caller
+ * falls back to a plain black screen -- boot_logo_draw already cleared it). */
+static int boot_logo_draw_custom(void)
+{
+    FILE *f = FIO_OpenFile(BOOT_LOGO_CUSTOM_FILE, O_RDONLY | O_SYNC);
+    if (!f) return 0;
+
+    int ok = 0;
+    struct bmp_file_t hdr;
+    if (FIO_ReadFile(f, &hdr, sizeof(hdr)) == sizeof(hdr) &&
+        hdr.signature == 0x4D42 && /* 'BM' */
+        hdr.hdr_size == 40 &&
+        hdr.planes == 1 &&
+        (hdr.bits_per_pixel == 24 || hdr.bits_per_pixel == 8) &&
+        hdr.compression == 0 &&
+        hdr.width == BOOT_LOGO_CUSTOM_W)
+    {
+        int32_t signed_height = (int32_t) hdr.height;
+        int top_down = (signed_height < 0);
+        int height = top_down ? -signed_height : signed_height;
+
+        /* "image" is a byte offset from the start of the file (per the BMP
+         * spec), not a real pointer -- see bmp_load_ram() for precedent. */
+        uint32_t data_offset = (uint32_t)(uintptr_t) hdr.image;
+
+        if (height == BOOT_LOGO_CUSTOM_H &&
+            FIO_SeekSkipFile(f, data_offset, SEEK_SET) == data_offset)
+        {
+            /* 8bpp: a pre-quantized indexed BMP, e.g. from the installer's
+             * off-camera dithering step (host CPU, real dithering libs, no
+             * boot-time budget to blow through). Each pixel byte IS the
+             * exact ML color index already -- no per-pixel math at all,
+             * just a copy. This is the fast/robust path; prefer it. The
+             * BMP's own embedded color table (between header and pixel
+             * data) is for desktop previewers only and is skipped over by
+             * the seek above -- the firmware never reads it. */
+            int fast_path = (hdr.bits_per_pixel == 8);
+
+            static uint8_t gray_lut[256];
+            if (!fast_path)
+                for (int i = 0; i < 256; i++)
+                    gray_lut[i] = 38 + i * 41 / 255; // COLOR_GRAY(0..100) range
+
+            uint8_t * const bvram = bmp_vram();
+            const int bytes_per_pixel = fast_path ? 1 : 3;
+            const int row_bytes = BOOT_LOGO_CUSTOM_W * bytes_per_pixel; // 720 or 2160, both already 4-byte aligned
+
+            ok = 1;
+            for (int row = 0; row < BOOT_LOGO_CUSTOM_H && ok; row += BOOT_LOGO_CUSTOM_ROWS_PER_READ)
+            {
+                int rows_this_batch = MIN(BOOT_LOGO_CUSTOM_ROWS_PER_READ, BOOT_LOGO_CUSTOM_H - row);
+                int batch_bytes = rows_this_batch * row_bytes;
+                if (FIO_ReadFile(f, boot_logo_custom_rows, batch_bytes) != batch_bytes)
+                {
+                    ok = 0;
+                    break;
+                }
+                for (int i = 0; i < rows_this_batch; i++)
+                {
+                    uint8_t *src = boot_logo_custom_rows + i * row_bytes;
+                    /* BMP rows are bottom-up unless height was negative. */
+                    int y = top_down ? (row + i) : (BOOT_LOGO_CUSTOM_H - 1 - (row + i));
+
+                    if (fast_path)
+                    {
+                        for (int x = 0; x < BOOT_LOGO_CUSTOM_W; x++)
+                            bmp_putpixel_fast(bvram, BOOT_LOGO_X + x, BOOT_LOGO_Y + y, src[x]);
+                        continue;
+                    }
+
+                    for (int x = 0; x < BOOT_LOGO_CUSTOM_W; x++)
+                    {
+                        uint8_t b = src[x*3 + 0];
+                        uint8_t g = src[x*3 + 1];
+                        uint8_t r = src[x*3 + 2];
+                        int luma = (77*r + 150*g + 29*b) >> 8; // ~0.299/0.587/0.114
+                        bmp_putpixel_fast(bvram, BOOT_LOGO_X + x, BOOT_LOGO_Y + y, gray_lut[luma]);
+                    }
+                }
+            }
+        }
+    }
+
+    FIO_CloseFile(f);
+    return ok;
+}
+
 static void boot_logo_draw(void)
 {
     /* Keep splash writes inside ML's normal LCD canvas.  The surrounding
      * 960x540 backing surface is changed by Canon during LV/zoom switches. */
     bmp_fill(COLOR_BLACK, 0, 0, 720, 480);
+
+    if (boot_logo_selected == BOOT_LOGO_CUSTOM_INDEX)
+    {
+        boot_logo_draw_custom();
+        return;
+    }
+
     const struct boot_logo_set *set = &boot_logo_sets[boot_logo_selected];
     for (int i = 0; i < set->count; i++)
     {
@@ -204,7 +334,13 @@ void boot_logo_show(void)
     /* Keep Canon's dialogs from overwriting the splash while it is visible. */
     boot_logo_active = 1;
     canon_gui_disable_front_buffer();
-    boot_logo_hide_time = get_ms_clock() + 2000;
     BMP_LOCK( boot_logo_present(); )
+
+    /* Start the on-screen timer only once the splash is actually drawn and
+     * flipped to front -- the Custom (BMP) logo streams a ~1MB file off the
+     * card and can take a while, so setting this beforehand could let the
+     * 2s budget elapse mid-draw and have the splash torn down again almost
+     * immediately after it finally appears. */
+    boot_logo_hide_time = get_ms_clock() + 2000;
     task_create("boot_logo", 0x1e, 0x1000, boot_logo_task, 0);
 }

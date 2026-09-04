@@ -41,8 +41,12 @@ void hist_build_raw();
 void
 hist_draw_image(
     unsigned        x_origin,
-    unsigned        y_origin
+    unsigned        y_origin,
+    unsigned        scale
 );
+
+int histogram_touch_toggle_at(int x, int y);
+int histogram_touch_scale(void);
 
 int raw_hist_get_percentile_level(int percentile, int gray_projection, int speed);
 int raw_hist_get_percentile_levels(int* percentiles_x10, int* output_raw_values, int n, int gray_projection, int speed);
@@ -65,7 +69,7 @@ void hist_invalidate_r2ev_cache(void);
 
 #if defined(CONFIG_SLIM_MENUS) && defined(FEATURE_WAVEFORM)
 void waveform_slim_scan_begin(void);
-void waveform_slim_scan_pixel(int bmp_j, int ev_bin);
+void waveform_slim_scan_pixel(int bmp_j, int ev_bin, int r_clip, int g_clip, int b_clip);
 int waveform_slim_using_raw_scan(void);
 void waveform_build_raw_slim(void);
 #endif

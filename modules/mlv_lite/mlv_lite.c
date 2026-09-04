@@ -100,6 +100,9 @@ static int dual_iso_skip_raw_preview(void)
 static int updowntoggle = 0; /* coming from crop_rec.c */
 extern int WEAK_FUNC(updowntoggle) Arrows_U_D;
 
+static int leftrighttoggle = 0; /* coming from crop_rec.c */
+extern int WEAK_FUNC(leftrighttoggle) Arrows_L_R;
+
 static int morehack = 0; /* coming from crop_rec.c */
 extern int WEAK_FUNC(morehack) more_hacks;
 
@@ -444,6 +447,7 @@ static GUARDED_BY(RawRecTask)   uint64_t mlv_start_timestamp = 0;
        GUARDED_BY(RawRecTask)   uint32_t raw_rec_trace_ctx = TRACE_ERROR;
 
 static int raw_rec_should_preview(void);
+static void lvrecov_log_state(void);
 
 /* old mlv_rec interface stuff here */
 struct msg_queue *mlv_block_queue = NULL;
@@ -942,6 +946,9 @@ static int get_estimated_compression_ratio()
 static int predict_frames(int write_speed, int available_slots)
 {
     int fps = fps_get_current_x1000();
+    if (fps == 0)
+        return INT_MAX;
+
     int avg_frame_size = (OUTPUT_COMPRESSION)
          ? frame_size_uncompressed / 100 * get_estimated_compression_ratio()
          : max_frame_size;
@@ -1006,13 +1013,16 @@ static MENU_UPDATE_FUNC(write_speed_update)
             OUTPUT_COMPRESSION ? " (%d%%)" : "",
             get_estimated_compression_ratio(), 0
         );
-        MENU_SET_WARNING(ok ? MENU_WARN_INFO : MENU_WARN_ADVICE, 
-            "%d.%d MB/s, %dx%s, %d.%03dp%s. %s",
-            speed/10, speed%10,
-            valid_slot_count, format_memory_size(max_frame_size),
-            fps/1000, fps%1000,
-            compress, guess_how_many_frames()
-        );
+        if (fps != 0)
+        {
+            MENU_SET_WARNING(ok ? MENU_WARN_INFO : MENU_WARN_ADVICE,
+                "%d.%d MB/s, %dx%s, %d.%03dp%s. %s",
+                speed/10, speed%10,
+                valid_slot_count, format_memory_size(max_frame_size),
+                fps/1000, fps%1000,
+                compress, guess_how_many_frames()
+            );
+        }
     }
 }
 
@@ -1410,15 +1420,18 @@ static MENU_UPDATE_FUNC(pre_recording_update)
         if (pre_frames == max_frames)
         {
             int fps = fps_get_current_x1000();
-            int total_sec = (slot_count * 1000 * 10 + fps/2) / fps;
-            int pre_sec   = (pre_frames * 1000 * 10 + fps/2) / fps;
-            MENU_SET_RINFO("max %d.%d", pre_sec/10, pre_sec%10);
-            MENU_SET_WARNING(
-                MENU_WARN_INFO,
-                "Using %d.%ds (%d frames) out of %d.%ds (%d frames) for pre-recording.",
-                pre_sec/10, pre_sec%10, pre_frames,
-                total_sec/10, total_sec%10, slot_count
-            );
+            if (fps != 0)
+            {
+                int total_sec = (slot_count * 1000 * 10 + fps/2) / fps;
+                int pre_sec   = (pre_frames * 1000 * 10 + fps/2) / fps;
+                MENU_SET_RINFO("max %d.%d", pre_sec/10, pre_sec%10);
+                MENU_SET_WARNING(
+                    MENU_WARN_INFO,
+                    "Using %d.%ds (%d frames) out of %d.%ds (%d frames) for pre-recording.",
+                    pre_sec/10, pre_sec%10, pre_frames,
+                    total_sec/10, total_sec%10, slot_count
+                );
+            }
         }
     }
 }
@@ -1963,6 +1976,9 @@ static int update_status(char * buffer, int buffer_size)
 {
     /* Calculate the stats */
     int fps = fps_get_current_x1000();  /* FPS x1000 */
+    if (fps == 0)
+        return COLOR_DARK_RED;
+
     int p = pre_recorded_frames();      /* pre-recorded frames */
     int r = (frame_count - 1 - p);      /* recorded frames */
     int t = (r * 1000) / fps;           /* recorded time - truncated */
@@ -2162,6 +2178,10 @@ static REQUIRES(ShootTask) EXCLUDES(settings_sem)
 unsigned int raw_rec_polling_cbr(unsigned int unused)
 {
     if (!compress_mq) return 0;
+
+    static int lvrecov_aux = INT_MIN;
+    if (should_run_polling_action(100, &lvrecov_aux))
+        lvrecov_log_state();
 
     raw_lv_request_update();
 
@@ -2463,7 +2483,7 @@ void hack_liveview(int unhack)
                     else
                     {
                         //Exclude certatin custom settings in crop rec.
-                        if (!Arrows_U_D && INFO_button != 2 && INFO_button != 3 && SET_button != 2 && SET_button != 3 && is_manual_focus())
+                        if (Arrows_U_D != 3 && Arrows_L_R != 3 && SET_button != 2 && SET_button != 3 && is_manual_focus())
                         {
                             aewbSuspend();
                         }
@@ -2921,7 +2941,11 @@ static void edmac_start_spy()
     /* write to raw buffer is always done on raw_write_chan (EDMAC_RAW_SLURP) */
     edmac_read_base = edmac_get_base(OUTPUT_COMPRESSION ? 8 : edmac_read_chan);
     edmac_wraw_base = edmac_get_base(raw_write_chan);
-    edmac_frame_duration = 1e9 / fps_get_current_x1000();
+    int fps = fps_get_current_x1000();
+    if (fps == 0)
+        return;
+
+    edmac_frame_duration = 1e9 / fps;
     if (show_edmac && !edmac_spy_active && !RAW_IS_IDLE)
     {
         edmac_spy_active = 1;
@@ -2932,6 +2956,111 @@ static void edmac_start_spy()
 static void edmac_stop_spy()
 {
     edmac_spy_active = 0;
+}
+
+/* Record only from a fully refreshed LiveView/RAW/EDMAC state. */
+static REQUIRES(RawRecTask)
+int raw_rec_start_ready(void)
+{
+    int fps = fps_get_current_x1000();
+    int raw_ready = raw_params_ready_for_rec();
+    int geometry_ready = res_x > 0 && res_y > 0 && raw_info.buffer;
+    int buffers_ready = max_frame_size > VIDF_HDR_SIZE
+        && frame_size_uncompressed > 0 && valid_slot_count >= 2;
+    int edmac_ready = edmac_get_base(raw_write_chan) != 0xffffffff
+        && edmac_get_base(OUTPUT_COMPRESSION ? 8 : edmac_read_chan) != 0xffffffff;
+
+    if (fps > 0 && raw_ready && geometry_ready && buffers_ready && edmac_ready)
+        return 1;
+
+    trace_write(raw_rec_trace_ctx,
+        "[start-check] fps=%d raw=%d geom=%d buf=%d edmac=%d res=%dx%d slots=%d frame=%d rawbuf=%x",
+        fps, raw_ready, geometry_ready, buffers_ready, edmac_ready,
+        res_x, res_y, valid_slot_count, max_frame_size, (uint32_t) raw_info.buffer);
+    return 0;
+}
+
+/* Event-only diagnostics for unstable LiveView transitions. */
+#define LVRECOV_LOG_FILE "ML/LOGS/LVRECOV.LOG"
+static int (*crop_rec_lv_transition_diag)(char *, int) =
+    MODULE_FUNCTION(crop_rec_lv_transition_diag);
+
+static void lvrecov_log_state(void)
+{
+    static int last_lv = -1;
+    static int last_invalid = -1;
+    static int last_fps = -1;
+    static int last_zoom = -1;
+    static int last_crop = -1;
+    static int last_ar = -1;
+    static int last_res_x = -1;
+    static int last_res_y = -1;
+    static int last_raw_x = -1;
+    static int last_raw_y = -1;
+    static int last_guard_signature = INT_MIN;
+
+    /* Never touch the card from this diagnostic path while a clip is active. */
+    if (RAW_IS_RECORDING || RAW_IS_PREPARING)
+        return;
+
+    int fps = fps_get_current_x1000();
+    int zoom = lv_dispsize;
+    int crop = get_config_var("crop.preset");
+    int ar = get_config_var("crop.preset_aspect_ratio");
+    int raw_ready = raw_params_ready_for_rec();
+    int geometry_ready = raw_info.width > 0 && raw_info.height > 0 && raw_info.buffer;
+    int buffers_ready = max_frame_size > VIDF_HDR_SIZE
+        && frame_size_uncompressed > 0 && valid_slot_count >= 2;
+    uint32_t edmac_read = edmac_get_base(OUTPUT_COMPRESSION ? 8 : edmac_read_chan);
+    uint32_t edmac_write = edmac_get_base(raw_write_chan);
+    int edmac_ready = edmac_read != 0xffffffff && edmac_write != 0xffffffff;
+    int invalid = lv && (fps <= 0 || !raw_ready || !geometry_ready || !buffers_ready || !edmac_ready);
+    char guard[128] = "";
+    int guard_signature = crop_rec_lv_transition_diag ?
+        crop_rec_lv_transition_diag(guard, sizeof(guard)) : 0;
+
+    if (lv == last_lv && invalid == last_invalid && fps == last_fps && zoom == last_zoom
+        && crop == last_crop && ar == last_ar && res_x == last_res_x && res_y == last_res_y
+        && raw_info.width == last_raw_x && raw_info.height == last_raw_y
+        && guard_signature == last_guard_signature)
+        return;
+
+    last_lv = lv;
+    last_invalid = invalid;
+    last_fps = fps;
+    last_zoom = zoom;
+    last_crop = crop;
+    last_ar = ar;
+    last_res_x = res_x;
+    last_res_y = res_y;
+    last_raw_x = raw_info.width;
+    last_raw_y = raw_info.height;
+    last_guard_signature = guard_signature;
+
+    char line[384];
+    int len = snprintf(line, sizeof(line),
+        "%08d %s lv=%d fps=%d zoom=x%d crop=%d ar=%d out=%dx%d raw=%dx%d buf=%08x slots=%d frame=%d ready=%d/%d/%d/%d edmac=%08x/%08x %s\n",
+        get_ms_clock(), invalid ? "INVALID" : "STATE",
+        lv, fps, zoom, crop, ar, res_x, res_y, raw_info.width, raw_info.height,
+        (uint32_t)raw_info.buffer, valid_slot_count, max_frame_size,
+        raw_ready, geometry_ready, buffers_ready, edmac_ready, edmac_read, edmac_write, guard);
+
+    unsigned size = 0;
+    FILE *f = FIO_CreateFileOrAppend(LVRECOV_LOG_FILE);
+    if (!f)
+        return;
+
+    FIO_GetFileSize(LVRECOV_LOG_FILE, &size);
+    if (size > 64 * 1024)
+    {
+        FIO_CloseFile(f);
+        f = FIO_CreateFile(LVRECOV_LOG_FILE);
+        if (!f)
+            return;
+    }
+
+    FIO_WriteFile(f, line, len);
+    FIO_CloseFile(f);
 }
 
 
@@ -3324,7 +3453,8 @@ void init_mlv_chunk_headers(struct raw_info * raw_info)
         file_hdr[thread].audioClass = 0;
         file_hdr[thread].videoFrameCount = 0; //autodetect
         file_hdr[thread].audioFrameCount = 0;
-        file_hdr[thread].sourceFpsNom = fps_get_current_x1000();
+        int fps = fps_get_current_x1000();
+        file_hdr[thread].sourceFpsNom = fps ? fps : 1;
         file_hdr[thread].sourceFpsDenom = 1000;
     }
     
@@ -3366,14 +3496,11 @@ void init_mlv_chunk_headers(struct raw_info * raw_info)
     
     if (cam_eos_m)
     {
-        /* 10bit */
+        /* Analog-gain bit depths: fixed whites (same clip points as LV zebras/hist).
+         * 14-bit: keep calibrated/autodetected white from raw_info (do not force 16200). */
         if (OUTPUT_10BIT) rawi_hdr.raw_info.white_level = 2870;
-        //11bit
         if (OUTPUT_11BIT) rawi_hdr.raw_info.white_level = 3692;
-        /* 12bit */
         if (OUTPUT_12BIT) rawi_hdr.raw_info.white_level = 5336;
-        /* 14bit */
-        if (OUTPUT_14BIT) rawi_hdr.raw_info.white_level = 16200;
     }
 
     mlv_fill_idnt(&idnt_hdr, mlv_start_timestamp);
@@ -3713,6 +3840,12 @@ void raw_video_rec_task(uint32_t thread)
 #endif
         give_semaphore(settings_sem);
 
+        if (!raw_rec_start_ready())
+        {
+            NotifyBox(2000, "LiveView stabilizing");
+            goto cleanup;
+        }
+
         hack_liveview(0);
         liveview_hacked = 1;
 
@@ -3743,14 +3876,19 @@ void raw_video_rec_task(uint32_t thread)
             beep();
         }
 
+        fps = fps_get_current_x1000();
+        if (fps == 0)
+        {
+            NotifyBox(2000, "LiveView not ready");
+            goto cleanup;
+        }
+
         /* signal start of recording to the compression task */
         msg_queue_post(compress_mq, INT_MAX);
         
         /* fake recording status, to integrate with other ml stuff (e.g. hdr video */
         set_recording_custom(CUSTOM_RECORDING_RAW);
         
-        fps = fps_get_current_x1000();
-
         /* this will enable the vsync CBR and the other task(s) */
         raw_recording_state = pre_record ? RAW_PRE_RECORDING : RAW_RECORDING;
     }
@@ -4730,7 +4868,7 @@ static int raw_rec_should_preview(void)
     if (lv_dispsize == 10) return 0;
 
     /* EOS M Settings → INFO Button = framing: toggle ML framing vs real-time LV. */
-    if (cam_eos_m && INFO_button == 4)
+    if (cam_eos_m && INFO_button == 6)
         return slim_info_framing_active;
 
     /* framing is incorrect in modes with high resolutions

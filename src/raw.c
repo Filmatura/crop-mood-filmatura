@@ -1077,7 +1077,8 @@ int raw_update_params_work()
         {
             /* raw dimensions changed in LiveView? return failure and wait for the next call */
             /* next valid call can be after two frames (until then, return failure) */
-            int frame_duration = 1000000 / fps_get_current_x1000();
+            int fps = fps_get_current_x1000();
+            int frame_duration = fps ? 1000000 / fps : 0;
             raw_set_dirty_with_timeout(frame_duration * 2);
             
             raw_info.width = width;
@@ -1232,8 +1233,19 @@ int raw_update_params_work()
         
         dbg_printf("dynamic range: %d.%02d EV (iso=%d)\n", raw_info.dynamic_range/100, raw_info.dynamic_range%100, raw2iso(iso));
     }
-    else /* movie mode, no tricks here */
+    else /* movie mode */
     {
+        /* 10/11/12-bit analog-gain modes keep calibrated fixed whites from
+         * get_default_white_level(). Full 14-bit must not assume 16200 —
+         * EOS M (and others) often clip lower, which made zebras/histogram
+         * miss real clipping while 12-bit stayed correct. */
+        if (BitDepth_Analog == 14)
+        {
+            int canon_white = shamem_read(0xC0F12054) >> 16;
+            if (canon_white < 1000 || canon_white > 16383)
+                canon_white = WHITE_LEVEL;
+            raw_info.white_level = autodetect_white_level(canon_white);
+        }
         raw_info.dynamic_range = compute_dynamic_range(black_mean, black_stdev_x100, raw_info.white_level);
     }
 #endif
@@ -1644,6 +1656,14 @@ static void autodetect_black_level_calc(int x1, int x2, int y1, int y2, int dx, 
 {
     int black = 0;
     int num = 0;
+
+    if (x1 < 0 || x2 <= x1 || y1 < 0 || y2 <= y1 || dx <= 0 || dy <= 0)
+    {
+        *out_mean = 2048;
+        *out_stdev_x100 = 800;
+        return;
+    }
+
     /* compute average level */
     for (int y = y1; y < y2; y += dy)
     {
@@ -1654,6 +1674,13 @@ static void autodetect_black_level_calc(int x1, int x2, int y1, int y2, int dx, 
             black += p;
             num++;
         }
+    }
+
+    if (num == 0)
+    {
+        *out_mean = 2048;
+        *out_stdev_x100 = 800;
+        return;
     }
 
     int mean = black / num;
@@ -1752,15 +1779,20 @@ static int autodetect_black_level(int* black_mean, int* black_stdev_x100)
         
     if (raw_info.active_area.x1 > 50) /* use the left black bar for black calibration */
     {
+        int x1 = 16;
+        int x2 = raw_info.active_area.x1 - 16;
+        int y1 = raw_info.active_area.y1 + 20;
+        int y2 = raw_info.active_area.y2 - 20;
+        if (x2 <= x1 || y1 < 0 || y2 <= y1 + 2)
+            return 0;
+
         autodetect_black_level_calc(
-            16, raw_info.active_area.x1 - 16,
-            raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20, 
+            x1, x2, y1, y2,
             3, 16,
             &mean1, &stdev1
         );
         autodetect_black_level_calc(
-            16, raw_info.active_area.x1 - 16,
-            raw_info.active_area.y1 + 22, raw_info.active_area.y2 - 20, 
+            x1, x2, y1 + 2, y2,
             3, 16,
             &mean2, &stdev2
         );
@@ -1768,27 +1800,32 @@ static int autodetect_black_level(int* black_mean, int* black_stdev_x100)
         /* for dual iso: increase tolerance of the cleaner exposure (there is interference from the noisier one) */
         int ref_stdev = MAX(stdev1, stdev2);
         
-        if (!black_level_check_left(mean1, ref_stdev, raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20))
+        if (!black_level_check_left(mean1, ref_stdev, y1, y2))
         {
             return 0;
         }
 
-        if (!black_level_check_left(mean2, ref_stdev, raw_info.active_area.y1 + 22, raw_info.active_area.y2 - 20))
+        if (!black_level_check_left(mean2, ref_stdev, y1 + 2, y2))
         {
             return 0;
         }
     }
     else /* use the top black bar for black calibration */
     {
+        int x1 = raw_info.active_area.x1 + 20;
+        int x2 = raw_info.active_area.x2 - 20;
+        int y1 = 4;
+        int y2 = raw_info.active_area.y1 - 4;
+        if (x1 < 0 || x2 <= x1 || y2 <= y1 + 2)
+            return 0;
+
         autodetect_black_level_calc(
-            raw_info.active_area.x1 + 20, raw_info.active_area.x2 - 20, 
-            4, raw_info.active_area.y1 - 4,
+            x1, x2, y1, y2,
             16, 4,
             &mean1, &stdev1
         );
         autodetect_black_level_calc(
-            raw_info.active_area.x1 + 20, raw_info.active_area.x2 - 20, 
-            6, raw_info.active_area.y1 - 4,
+            x1, x2, y1 + 2, y2,
             16, 4,
             &mean2, &stdev2
         );

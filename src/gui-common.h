@@ -25,6 +25,8 @@
 #define MLEV_AV_LONG -17
 #define MLEV_TRIGGER_ZEBRAS_FOR_PLAYBACK -18
 #define MLEV_JOYSTICK_LONG -19
+#define MLEV_CUSTOM_MENU_LONG -20
+#define MLEV_CUSTOM_MARK_LONG -21
 
 /* half-shutter button codes (they are consecutive after BGMT_PRESS_HALFSHUTTER) */
 #define BGMT_UNPRESS_HALFSHUTTER (BGMT_PRESS_HALFSHUTTER+1)
@@ -258,6 +260,10 @@ int handle_upside_down(struct event * event);
 int handle_swap_menu_erase(struct event * event);
 int handle_swap_info_play(struct event * event);
 int handle_ml_menu_keys(struct event * event);
+#ifdef CONFIG_SLIM_MENUS
+/* Decode the EOS M touch event's W1[1] packed coordinate word. */
+int eosm_touch_get_xy(struct event *event, int *x, int *y);
+#endif
 int handle_digic_poke(struct event * event);
 int handle_mlu_handheld(struct event * event);
 int handle_buttons_being_held(struct event * event);

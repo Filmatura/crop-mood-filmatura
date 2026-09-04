@@ -40,12 +40,142 @@ struct Histogram histogram;
 
 #define HIST_METER_DYNAMIC_RANGE 1
 #define HIST_METER_ETTR_HINT 2
+#define HIST_SHADOW_METER_HEIGHT 5
 
 static void histobar_refresh();
 
 static int r2ev_white_level = -1;
 static int r2ev_black_level = -1;
 static char r2ev[16384];
+static int hist_shadow_meter_risk = -1; /* 0=safe, 1000=noise-floor loss */
+static int hist_touch_expanded;
+static int hist_touch_x, hist_touch_y, hist_touch_w, hist_touch_h;
+
+int histogram_touch_scale(void)
+{
+    return hist_touch_expanded ? 2 : 1;
+}
+
+int histogram_touch_toggle_at(int x, int y)
+{
+    if (!monitoring_enabled(hist_draw))
+        return 0;
+    if (x < hist_touch_x || x >= hist_touch_x + hist_touch_w ||
+        y < hist_touch_y || y >= hist_touch_y + hist_touch_h)
+        return 0;
+
+    /* Histograms are direct bitmap pixels rather than retained UI widgets.
+     * Clear the previous full footprint first; otherwise shrinking leaves the
+     * old right/top part of the 2x graph on screen until another UI redraw. */
+    monitoring_graph_clear_region(hist_touch_x - 1, hist_touch_y - 1,
+                                  hist_touch_w + 2, hist_touch_h + 2);
+    hist_touch_expanded = !hist_touch_expanded;
+    return 1;
+}
+
+static uint32_t hist_raw_bin_samples(int i)
+{
+    return MAX(histogram.hist[i], MAX(histogram.hist_r[i],
+        MAX(histogram.hist_g[i], histogram.hist_b[i])));
+}
+
+/* Return the RAW EV-histogram bin at a low-image percentile (x10).
+ * The RAW scanner already builds these bins at the histogram refresh rate,
+ * so the shadow meter adds no second image scan or recording-time workload. */
+static int hist_raw_shadow_percentile_bin(int percentile_x10)
+{
+    uint32_t target = MAX((uint64_t)histogram.total_px * percentile_x10 / 1000, 1);
+    uint32_t accumulated = 0;
+
+    for (int i = 0; i < HIST_WIDTH; i++)
+    {
+        /* Slim builds a green/luma histogram; normal builds RGB histograms.
+         * One channel's maximum represents a pixel once in either case. */
+        uint32_t samples = hist_raw_bin_samples(i);
+        accumulated += samples;
+        if (accumulated >= target)
+            return i;
+    }
+
+    return HIST_WIDTH - 1;
+}
+
+/* Ratio of the sampled RAW frame at/below the calculated noise floor.
+ * Unlike a single percentile this changes smoothly as a dark subject fills
+ * more of the frame, while retaining the same histogram sample data. */
+static int hist_raw_noise_floor_ratio(int noise_bin)
+{
+    uint32_t below = 0;
+    uint32_t total = 0;
+
+    for (int i = 0; i < HIST_WIDTH; i++)
+    {
+        uint32_t samples = hist_raw_bin_samples(i);
+        total += samples;
+        if (i <= noise_bin)
+            below += samples;
+    }
+
+    return total ? (int)((uint64_t)below * 1000 / total) : 0;
+}
+
+static void hist_draw_shadow_meter(uint8_t *bvram, unsigned x_origin,
+                                   unsigned y_origin, unsigned graph_height,
+                                   unsigned scale)
+{
+    /* raw_info.dynamic_range is in 1/100 EV. The leftmost histogram bins are
+     * the sensor noise floor; evaluate how much meaningful image reaches it. */
+    int noise_bin = COERCE((1200 - raw_info.dynamic_range) *
+        (HIST_WIDTH - 1) / 1200, 0, HIST_WIDTH - 1);
+    int shadow_10_bin = hist_raw_shadow_percentile_bin(100);
+    int floor_ratio = hist_raw_noise_floor_ratio(noise_bin);
+    int target_risk;
+    int color;
+    int width;
+    int hist_width = HIST_WIDTH * scale;
+    int y = y_origin + graph_height + 3 * scale;
+
+    /* 0-1% at the floor: safe. 1-10%: caution. Red requires both 10%+
+     * coverage and the darkest tenth at the floor, so a narrow intentional
+     * black peak cannot trigger a red warning by itself. */
+    if (floor_ratio < 10)
+        target_risk = floor_ratio * 330 / 10;
+    else if (floor_ratio < 100)
+        target_risk = 330 + (floor_ratio - 10) * 330 / 90;
+    else if (shadow_10_bin <= noise_bin + 2)
+        target_risk = 660 + MIN(floor_ratio - 100, 400) * 340 / 400;
+    else
+        target_risk = 659;
+
+    /* The histogram is already temporally sampled at the monitoring refresh
+     * rate. Do not add a second exponential smoother here: it made the meter
+     * take many histogram updates (several seconds) to reach the real scene. */
+    hist_shadow_meter_risk = target_risk;
+
+    /* Color states are coverage based: <1% green, 1-10% yellow, and red
+     * only for widespread crushed shadows at the actual RAW noise floor. */
+    if (hist_shadow_meter_risk < 330)
+        color = COLOR_GREEN2;
+    else if (hist_shadow_meter_risk < 660)
+        color = COLOR_YELLOW;
+    else
+        color = COLOR_RED;
+
+    /* Keep a small visible safe-state segment without implying that the
+     * meter is empty; red still reaches the full histogram width. */
+    width = hist_width / 8 + hist_shadow_meter_risk *
+        (hist_width * 7 / 8) / 1000;
+    width = COERCE(width, 1, hist_width);
+
+    /* Clear the old length first, then draw the current centered solid bar. */
+    for (int row = 0; row < 2 * scale; row++)
+        for (int x = 0; x < hist_width; x++)
+            bvram[x_origin + x + (y + row) * BMPPITCH] = COLOR_BG;
+    for (int row = 0; row < 2 * scale; row++)
+        for (int x = (hist_width - width) / 2;
+             x < (hist_width + width) / 2; x++)
+            bvram[x_origin + x + (y + row) * BMPPITCH] = color;
+}
 
 static void hist_build_r2ev_cache()
 {
@@ -91,17 +221,34 @@ static void hist_smooth_3tap(const uint32_t *src, uint32_t *dst)
     }
 }
 
+static void hist_smooth_5tap(const uint32_t *src, uint32_t *dst)
+{
+    for (int i = 0; i < HIST_WIDTH; i++)
+    {
+        int l2 = src[i > 1 ? i - 2 : 0];
+        int l1 = src[i > 0 ? i - 1 : 0];
+        int c  = src[i];
+        int r1 = src[i < HIST_WIDTH - 1 ? i + 1 : HIST_WIDTH - 1];
+        int r2 = src[i < HIST_WIDTH - 2 ? i + 2 : HIST_WIDTH - 1];
+        dst[i] = (l2 + 2 * l1 + 4 * c + 2 * r1 + r2) / 10;
+    }
+}
+
 static void hist_prepare_smooth_display(void)
 {
-    /* Spatial smooth only — peaks follow the scene on the next draw. */
-    hist_smooth_3tap(histogram.hist, hist_smooth);
+    if (monitoring_precision(hist_draw))
+        hist_smooth_5tap(histogram.hist, hist_smooth);
+    else
+        hist_smooth_3tap(histogram.hist, hist_smooth);
 }
 
 static int hist_slim_scan_raw_pixels(int accumulate_hist)
 {
     if (!raw_update_params()) return 0;
 
-    int step = lv ? 4 : 2;
+    int precision_scan = monitoring_slim_precision_scan();
+    int step = lv ? (precision_scan ? 2 : 4) : 2;
+    int x_step = precision_scan ? 4 : 8;
     hist_build_r2ev_cache();
 
 #if defined(FEATURE_WAVEFORM)
@@ -113,7 +260,7 @@ static int hist_slim_scan_raw_pixels(int accumulate_hist)
         int y = BM2RAW_Y(i);
         if (y < raw_info.active_area.y1+8 || y > raw_info.active_area.y2-8) continue;
 
-        for (int j = os.x0; j < os.x_max; j += 8)
+        for (int j = os.x0; j < os.x_max; j += x_step)
         {
             int x = BM2RAW_X(j);
             if (x < raw_info.active_area.x1+8 || x > raw_info.active_area.x2-8) continue;
@@ -133,7 +280,12 @@ static int hist_slim_scan_raw_pixels(int accumulate_hist)
                 histogram.total_px++;
             }
 #if defined(FEATURE_WAVEFORM)
-            waveform_slim_scan_pixel(j, ev);
+            /* Use the exact same final RAW histogram bin as the clipping
+             * indicators.  The waveform must not use a separate 98% rule. */
+            waveform_slim_scan_pixel(j, ev,
+                r2ev[r] == HIST_WIDTH - 1,
+                r2ev[g] == HIST_WIDTH - 1,
+                r2ev[b] == HIST_WIDTH - 1);
 #endif
         }
     }
@@ -389,7 +541,8 @@ static int (*auto_ettr_export_correction)(int* out) = MODULE_FUNCTION(auto_ettr_
  */
 void hist_draw_image(
     unsigned        x_origin,
-    unsigned        y_origin
+    unsigned        y_origin,
+    unsigned        scale
 )
 {
     #ifdef FEATURE_RAW_HISTOGRAM
@@ -406,6 +559,21 @@ void hist_draw_image(
 
     // Align the x origin, just in case
     x_origin &= ~3;
+    scale = COERCE(scale, 1, 2);
+
+#ifdef FEATURE_RAW_HISTOGRAM
+    /* Keep the meter within the normal histogram allocation so its bottom
+     * placement remains safe for the screen-edge histogram layout. */
+    unsigned graph_height = (histogram.is_raw ?
+        hist_height - HIST_SHADOW_METER_HEIGHT : hist_height) * scale;
+#else
+    unsigned graph_height = hist_height * scale;
+#endif
+    unsigned hist_width = HIST_WIDTH * scale;
+    hist_touch_x = x_origin;
+    hist_touch_y = y_origin;
+    hist_touch_w = hist_width;
+    hist_touch_h = hist_height * scale;
 
     uint8_t * row = bvram + x_origin + y_origin * BMPPITCH;
     if( histogram.max == 0 )
@@ -424,40 +592,40 @@ void hist_draw_image(
         // Scale by the maximum bin value
 #ifdef CONFIG_SLIM_MENUS
         const uint32_t hist_val = histogram.is_rgb ? histogram.hist[i] : hist_smooth[i];
-        const uint32_t size  = hist_log ? log_length(hist_val)   * hist_height / log_max : (hist_val   * hist_height) / histogram.max;
+        const uint32_t size  = hist_log ? log_length(hist_val)   * graph_height / log_max : (hist_val   * graph_height) / histogram.max;
 #else
-        const uint32_t size  = hist_log ? log_length(histogram.hist[i])   * hist_height / log_max : (histogram.hist[i]   * hist_height) / histogram.max;
+        const uint32_t size  = hist_log ? log_length(histogram.hist[i])   * graph_height / log_max : (histogram.hist[i]   * graph_height) / histogram.max;
 #endif
-        const uint32_t sizeR = hist_log ? log_length(histogram.hist_r[i]) * hist_height / log_max : (histogram.hist_r[i] * hist_height) / histogram.max;
-        const uint32_t sizeG = hist_log ? log_length(histogram.hist_g[i]) * hist_height / log_max : (histogram.hist_g[i] * hist_height) / histogram.max;
-        const uint32_t sizeB = hist_log ? log_length(histogram.hist_b[i]) * hist_height / log_max : (histogram.hist_b[i] * hist_height) / histogram.max;
+        const uint32_t sizeR = hist_log ? log_length(histogram.hist_r[i]) * graph_height / log_max : (histogram.hist_r[i] * graph_height) / histogram.max;
+        const uint32_t sizeG = hist_log ? log_length(histogram.hist_g[i]) * graph_height / log_max : (histogram.hist_g[i] * graph_height) / histogram.max;
+        const uint32_t sizeB = hist_log ? log_length(histogram.hist_b[i]) * graph_height / log_max : (histogram.hist_b[i] * graph_height) / histogram.max;
 
-        uint8_t * col = row + i;
+        uint8_t * col = row + i * scale;
         // vertical line up to the hist size
-        for( y=hist_height ; y>0 ; y-- , col += BMPPITCH )
+        for( y=graph_height ; y>0 ; y-- , col += BMPPITCH )
         {
-            if (histogram.is_rgb)
-                *col = hist_rgb_color(y, sizeR, sizeG, sizeB);
-            else
-                *col = y > size ? COLOR_BG :
+            int pixel = histogram.is_rgb ? hist_rgb_color(y, sizeR, sizeG, sizeB) :
+                y > size ? COLOR_BG :
 #if defined(FEATURE_FALSE_COLOR)
                                              falsecolor_fordraw(((i << 8) / HIST_WIDTH) & 0xFF);
 #else
                                              COLOR_WHITE;
 #endif /* defined(FEATURE_FALSE_COLOR) */
+            for (int sx = 0; sx < scale; sx++)
+                col[sx] = pixel;
         }
 
 #if defined(FEATURE_HISTOGRAM)
         /* draw clip warnings */
 #ifdef CONFIG_SLIM_MENUS
-        if (hist_draw && i == HIST_WIDTH - 1)
+        if (monitoring_enabled(hist_draw) && i == HIST_WIDTH - 1)
 #else
         if (hist_warn && i == HIST_WIDTH - 1)
 #endif
         {
             unsigned int thr = histogram.total_px / 100000; // start at 0.0001 with a tiny dot
             thr = MAX(thr, 1);
-            int yw = y_origin + 12 + (hist_log ? hist_height - 24 : 0);
+            int yw = y_origin + (12 + (hist_log ? hist_height - 24 : 0)) * scale;
             int bg = (hist_log ? COLOR_WHITE : COLOR_BLACK);
             if (histogram.is_rgb
                 #ifdef FEATURE_RAW_HISTOGRAM
@@ -470,9 +638,11 @@ void hist_draw_image(
                 unsigned int over_b = histogram.hist_b[i];
 
 #ifdef CONFIG_SLIM_MENUS
-                if (over_r > thr) hist_dot(x_origin + HIST_WIDTH/2 - 25, yw, COLOR_RED,   bg, hist_clip_dot_radius(over_r, histogram.total_px), hist_clip_dot_label(over_r, histogram.total_px));
-                if (over_g > thr) hist_dot(x_origin + HIST_WIDTH/2     , yw, COLOR_GREEN2, bg, hist_clip_dot_radius(over_g, histogram.total_px), hist_clip_dot_label(over_g, histogram.total_px));
-                if (over_b > thr) hist_dot(x_origin + HIST_WIDTH/2 + 25, yw, COLOR_CYAN,  bg, hist_clip_dot_radius(over_b, histogram.total_px), hist_clip_dot_label(over_b, histogram.total_px));
+                /* Keep clipping points at their normal physical size when the
+                 * graph grows; only their positions follow the graph scale. */
+                if (over_r > thr) hist_dot(x_origin + HIST_WIDTH*scale/2 - 25*scale, yw, COLOR_RED,   bg, hist_clip_dot_radius(over_r, histogram.total_px), hist_clip_dot_label(over_r, histogram.total_px));
+                if (over_g > thr) hist_dot(x_origin + HIST_WIDTH*scale/2           , yw, COLOR_GREEN2, bg, hist_clip_dot_radius(over_g, histogram.total_px), hist_clip_dot_label(over_g, histogram.total_px));
+                if (over_b > thr) hist_dot(x_origin + HIST_WIDTH*scale/2 + 25*scale, yw, COLOR_CYAN,  bg, hist_clip_dot_radius(over_b, histogram.total_px), hist_clip_dot_label(over_b, histogram.total_px));
 #else
                 if (over_r > thr) hist_dot(x_origin + HIST_WIDTH/2 - 25, yw, COLOR_RED,        bg, hist_clip_dot_radius(over_r, histogram.total_px), hist_clip_dot_label(over_r, histogram.total_px));
                 if (over_g > thr) hist_dot(x_origin + HIST_WIDTH/2     , yw, COLOR_GREEN1,     bg, hist_clip_dot_radius(over_g, histogram.total_px), hist_clip_dot_label(over_g, histogram.total_px));
@@ -482,7 +652,7 @@ void hist_draw_image(
             else
             {
                 unsigned int over = histogram.hist[i] + histogram.hist[i-1];
-                if (over > thr) hist_dot(x_origin + HIST_WIDTH/2, yw, COLOR_RED, bg, hist_clip_dot_radius(over, histogram.total_px), hist_clip_dot_label(over, histogram.total_px));
+                if (over > thr) hist_dot(x_origin + HIST_WIDTH*scale/2, yw, COLOR_RED, bg, hist_clip_dot_radius(over, histogram.total_px), hist_clip_dot_label(over, histogram.total_px));
             }
         }
 #endif
@@ -499,9 +669,12 @@ void hist_draw_image(
     }
 
     /* draw histogram border */
-    bmp_draw_rect(60, x_origin-1, y_origin-1, HIST_WIDTH+2, hist_height+2);
+    bmp_draw_rect(60, x_origin-1, y_origin-1, hist_width+2, graph_height+2);
 
     #ifdef FEATURE_RAW_HISTOGRAM
+    if (histogram.is_raw)
+        hist_draw_shadow_meter(bvram, x_origin, y_origin, graph_height, scale);
+
     if (histogram.is_raw && hist_meter)
     {
         char msg[10];

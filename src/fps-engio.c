@@ -1092,10 +1092,42 @@ static void fps_change_value(void* priv, int delta)
     if (get_fps_override()) fps_needs_updating = 1;
 }
 
+/* shutter speed before FPS override was last turned on, so it can be put
+ * back exactly when the user turns override off again -- neither Canon's
+ * firmware nor the FPS timer/blanking code below restores it on their own,
+ * they only keep the sensor's *actual* exposure consistent under the hood
+ * while the *displayed* shutter value is left wherever it last landed. */
+static int fps_saved_raw_shutter = 0;
+
+/* DIAGNOSTIC: mark toggle events so ML/CROPLOG.TXT's register trace (see
+ * crop_rec.c) can be lined up against exactly when the user flipped the
+ * setting. This runs in the menu task, a normal safe context for direct
+ * file I/O (unlike the ADTG hook the other log is filled from). */
+static void fps_log_toggle(int now_on)
+{
+    FILE *f = FIO_CreateFileOrAppend("ML/FPSLOG.TXT");
+    if (!f) return;
+    char line[64];
+    int len = snprintf(line, sizeof(line), "%lu TOGGLE %s\n",
+        (unsigned long)get_ms_clock(), now_on ? "ON" : "OFF");
+    FIO_WriteFile(f, line, len);
+    FIO_CloseFile(f);
+}
+
 static void fps_enable_disable(void* priv, int delta)
 {
     #ifdef FEATURE_FPS_OVERRIDE
+    if (!fps_override)
+    {
+        fps_saved_raw_shutter = lens_info.raw_shutter;
+    }
     fps_override = !fps_override;
+    fps_log_toggle(fps_override);
+    if (!fps_override && fps_saved_raw_shutter)
+    {
+        lens_set_rawshutter(fps_saved_raw_shutter);
+        fps_saved_raw_shutter = 0;
+    }
     #endif
     if (get_fps_override()) fps_needs_updating = 1;
 }

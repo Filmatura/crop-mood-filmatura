@@ -554,7 +554,12 @@ int FIO_WriteFile( FILE* stream, const void* ptr, size_t count )
         sync_caches();
     }
 
-    return _FIO_WriteFile(stream, ptr, count);
+    /*
+     * FIO writes are performed by DMA.  The cache flush above makes cached
+     * data visible; passing the uncacheable alias keeps the transfer coherent
+     * on every supported memory layout.
+     */
+    return _FIO_WriteFile(stream, UNCACHEABLE(ptr), count);
 }
 
 FILE* FIO_CreateFileOrAppend(const char* name)

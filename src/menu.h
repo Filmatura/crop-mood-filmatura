@@ -311,10 +311,29 @@ extern void menu_numeric_toggle(int* val, int delta, int min, int max);
 extern void run_in_separate_task(void* routine, int argument);
 
 extern void menu_add( const char * name, struct menu_entry * new_entry, int count );
+extern void menu_move_entry_after(const char * menu_name,
+    const char * entry_name, const char * after_name);
+
+/* Tweaks → Slim Settings entry; registered after EOS M button settings. */
+extern void anamorphic_preview_add_slim_menu(void);
 
 extern void menu_remove(const char * name, struct menu_entry * old_entry, int count);
 
 extern void select_menu_by_name(char* name, const char* entry_name);
+
+#ifdef CONFIG_SLIM_MENUS
+/** Select the first navigable entry in a top-level menu (grid launcher category). */
+extern void menu_select_first_entry(char* name);
+/** Remember highlighted setting (updated while browsing the ML menu). */
+extern void menu_remember_selection(struct menu_entry * entry);
+#endif
+
+/** Open ML menu at a specific entry, skipping slim grid launcher when needed. */
+extern void gui_open_menu_at_entry(const char * menu_name, const char * entry_name);
+/** Open last highlighted menu setting (recording-screen touch). */
+extern void gui_open_last_menu_selection(void);
+/** Open the user-marked Custom page directly from Live View. */
+extern void gui_open_custom_menu(void);
 
 extern void
 menu_init( void );
@@ -370,6 +389,9 @@ extern MENU_UPDATE_FUNC(menu_advanced_update);
 
 /* post a redraw event to menu task */
 void menu_redraw();
+#ifdef CONFIG_SLIM_MENUS
+void slim_touch_scroll_cancel(void);
+#endif
 
 /* should be obsolete, need to double-check */
 void menu_set_dirty();
@@ -412,6 +434,7 @@ void menu_toggle_submenu();
 
 int menu_get_value_from_script(const char* name, const char* entry_name);
 char* menu_get_str_value_from_script(const char* name, const char* entry_name, struct menu_display_info * info);
+int menu_adjust_value_by_name(const char* name, const char* entry_name, int delta);
 int menu_set_value_from_script(const char* name, const char* entry_name, int value);
 int menu_set_str_value_from_script(const char* name, const char* entry_name, char* value, int value_int);
 

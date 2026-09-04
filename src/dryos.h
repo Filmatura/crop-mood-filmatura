@@ -86,6 +86,12 @@ take_semaphore(
         int                     timeout_interval
 ) ACQUIRE(semaphore) NO_THREAD_SAFETY_ANALYSIS;
 
+/* Non-blocking semaphore acquire; safe for interrupt-time diagnostics. */
+extern int
+take_semaphore_now(
+        struct semaphore *      semaphore
+) ACQUIRE(semaphore) NO_THREAD_SAFETY_ANALYSIS;
+
 extern int
 give_semaphore(
         struct semaphore *      semaphore

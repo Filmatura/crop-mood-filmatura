@@ -281,6 +281,8 @@ bmp_fill(
 
 void bmp_draw_rect(int color, int x0, int y0, int w, int h);
 void bmp_draw_rect_chamfer(int color, int x0, int y0, int w, int h, int a, int thick_corners);
+void bmp_draw_antialiased_triangle(int tip_x, int tip_y, int direction,
+                                   int depth, int height, int color);
 
 
 /** Some selected colors */

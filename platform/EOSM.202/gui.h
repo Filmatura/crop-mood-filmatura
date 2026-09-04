@@ -15,6 +15,9 @@
 
 #define BGMT_MENU 0x6
 #define BGMT_INFO 0x7
+/* Digic5 pairs many buttons as press N / unpress N+1 (e.g. SET 4/5).
+ * Used by slim INFO long-press; if unused by Canon it is simply never seen. */
+#define BGMT_UNPRESS_INFO 0x8
 #define BGMT_PLAY 0xb
 #define BGMT_TRASH 0xD // not present on the camera, but appears to be interpreted correctly by Canon code, http://www.magiclantern.fm/forum/index.php?topic=15895.msg196560#msg196560
 #define BGMT_REC 0x1E

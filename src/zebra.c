@@ -40,6 +40,7 @@
 #include "focus.h"
 #include "lvinfo.h"
 #include "powersave.h"
+#include "menu-grid.h"
 
 #include "imgconv.h"
 #include "falsecolor.h"
@@ -66,6 +67,10 @@
 
 // spotmeter_formula modes
 #define SPTMTR_F_RGB_PERCENT 4
+
+/* Graph touch handling needs the common overlay cleanup path before its
+ * definition later in this file. */
+void redraw(void);
 
 #ifdef CONFIG_KILL_FLICKER // this will block all Canon drawing routines when the camera is idle 
 extern int kill_canon_gui_mode;
@@ -158,7 +163,7 @@ static int show_lv_fps = 0; // for debugging
 #define WAVEFORM_FACTOR (1 << waveform_size) // 1, 2 or 4
 #define WAVEFORM_OFFSET (waveform_size <= 1 ? 80 : 0)
 
-#define WAVEFORM_FULLSCREEN (waveform_draw && waveform_size == 2)
+#define WAVEFORM_FULLSCREEN (monitoring_enabled(waveform_draw) && waveform_size == 2)
 
 CONFIG_INT("lv.disp.profiles", disp_profiles_0, 0);
 
@@ -316,7 +321,7 @@ static CONFIG_INT( "focus.peaking.disp", focus_peaking_disp, 0); // display as d
 #define focus_peaking_disp 0
 #endif
 
-int focus_peaking_as_display_filter() 
+int focus_peaking_as_display_filter()
 {
     #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
     return lv && focus_peaking && focus_peaking_disp;
@@ -325,7 +330,7 @@ int focus_peaking_as_display_filter()
     #endif
 }
 
-static CONFIG_INT( "waveform.draw", waveform_draw,
+CONFIG_INT( "waveform.draw", waveform_draw,
 #ifdef CONFIG_4_3_SCREEN
 1
 #else
@@ -341,7 +346,7 @@ int histogram_or_small_waveform_enabled()
     (
         #ifdef FEATURE_HISTOGRAM
         (
-            (hist_draw) &&
+            (monitoring_enabled(hist_draw)) &&
             #ifdef FEATURE_RAW_OVERLAYS
             !(RAW_HISTOBAR_ENABLED && can_use_raw_overlays_menu()) &&
             #endif
@@ -349,7 +354,7 @@ int histogram_or_small_waveform_enabled()
         )
         ||
         #endif
-        (waveform_draw && !waveform_size)
+        (monitoring_enabled(waveform_draw) && !waveform_size)
     )
     && get_expsim(); 
 }
@@ -383,6 +388,25 @@ static uint8_t* bvram_mirror_start = 0;
 static uint8_t* bvram_mirror = 0;
 uint8_t* get_bvram_mirror() { return bvram_mirror; }
 //~ #define bvram_mirror bmp_vram_idle()
+
+void monitoring_graph_clear_region(int x, int y, int w, int h)
+{
+    x = COERCE(x, BMP_W_MINUS, BMP_W_PLUS - 1);
+    y = COERCE(y, BMP_H_MINUS, BMP_H_PLUS - 1);
+    w = COERCE(w, 0, BMP_W_PLUS - x - 1);
+    h = COERCE(h, 0, BMP_H_PLUS - y - 1);
+
+    BMP_LOCK(
+        /* Clear both copies. Clearing only the visible buffer lets a later
+         * mirror refresh restore the old 2x graph as a black rectangle. */
+        bmp_fill(0, x, y, w, h);
+        if (bvram_mirror)
+        {
+            for (int row = y; row < y + h; row++)
+                memset(bvram_mirror + BM(x, row), 0, w);
+        }
+    )
+}
 
 #include "cropmarks.c"
 
@@ -462,6 +486,36 @@ int get_global_draw_setting() // whatever is set in menu
 static uint8_t* waveform = 0;
 #define WAVEFORM_UNSAFE(x,y) (waveform[(x) + (y) * WAVEFORM_WIDTH])
 #define WAVEFORM(x,y) (waveform[COERCE((x), 0, WAVEFORM_WIDTH-1) + COERCE((y), 0, WAVEFORM_HEIGHT-1) * WAVEFORM_WIDTH])
+static int waveform_touch_expanded;
+static int waveform_touch_x, waveform_touch_y, waveform_touch_w, waveform_touch_h;
+static uint32_t waveform_clip_r, waveform_clip_g, waveform_clip_b, waveform_clip_total;
+
+int monitoring_graph_touch_toggle(int x, int y)
+{
+    if (histogram_touch_toggle_at(x, y))
+    {
+        /* histogram_touch_toggle_at already clears the previous footprint.
+         * The normal overlay task will draw the new size without asking Canon
+         * to redraw its dialog/front buffer. */
+        return 1;
+    }
+
+    if (!monitoring_enabled(waveform_draw) ||
+        x < waveform_touch_x || x >= waveform_touch_x + waveform_touch_w ||
+        y < waveform_touch_y || y >= waveform_touch_y + waveform_touch_h)
+        return 0;
+
+    /* Like the histogram, remove every pixel of the old graph, including
+     * the external clipping-dot lane, before switching its scale. */
+    monitoring_graph_clear_region(waveform_touch_x - 1,
+                                  waveform_touch_y - 1,
+                                  waveform_touch_w + 20,
+                                  waveform_touch_h + 2);
+    waveform_touch_expanded = !waveform_touch_expanded;
+    /* The normal overlay task redraws this at its next monitoring refresh.
+     * Never call the generic redraw path here: it temporarily exposes Canon. */
+    return 1;
+}
 
 /** Generate the histogram data from the YUV frame buffer.
  *
@@ -514,18 +568,28 @@ static inline void waveform_add_pixel(int x, int Y)
     if ((*w) < 250) (*w)++;
 }
 
+static inline void waveform_add_clip_pixel(uint32_t pixel)
+{
+    int Y, R, G, B;
+    COMPUTE_UYVY2YRGB(pixel, Y, R, G, B);
+    waveform_clip_total++;
+    if (R >= 254) waveform_clip_r++;
+    if (G >= 254) waveform_clip_g++;
+    if (B >= 254) waveform_clip_b++;
+}
+
 #if defined(CONFIG_SLIM_MENUS)
 static int slim_wf_from_raw_scan = 0;
 
 void waveform_slim_scan_begin(void)
 {
     slim_wf_from_raw_scan = 0;
-    if (!waveform_draw || !can_use_raw_overlays()) return;
+    if (!monitoring_enabled(waveform_draw) || !can_use_raw_overlays()) return;
     waveform_init();
     slim_wf_from_raw_scan = 1;
 }
 
-void waveform_slim_scan_pixel(int bmp_j, int ev_bin)
+void waveform_slim_scan_pixel(int bmp_j, int ev_bin, int r_clip, int g_clip, int b_clip)
 {
     if (!slim_wf_from_raw_scan || !waveform) return;
     int Y = (ev_bin * 255 + (HIST_WIDTH-1)/2) / (HIST_WIDTH-1);
@@ -533,6 +597,10 @@ void waveform_slim_scan_pixel(int bmp_j, int ev_bin)
     int bin_y = COERCE((Y * WAVEFORM_HEIGHT) >> 8, 0, WAVEFORM_HEIGHT-1);
     uint8_t* w = &waveform[bin_x + bin_y * WAVEFORM_WIDTH];
     if ((*w) < 250) (*w)++;
+    waveform_clip_total++;
+    if (r_clip) waveform_clip_r++;
+    if (g_clip) waveform_clip_g++;
+    if (b_clip) waveform_clip_b++;
 }
 
 int waveform_slim_using_raw_scan(void)
@@ -557,12 +625,12 @@ hist_build()
 
     #ifdef FEATURE_WAVEFORM
 #if defined(CONFIG_SLIM_MENUS)
-    if (waveform_draw && !can_use_raw_overlays())
+    if (monitoring_enabled(waveform_draw) && !can_use_raw_overlays())
         waveform_init();
 #else
-    if (waveform_draw)
+    if (monitoring_enabled(waveform_draw))
         waveform_init();
-#endif
+    #endif
     #endif
     
     #ifdef FEATURE_VECTORSCOPE
@@ -580,7 +648,7 @@ hist_build()
         hist_build_raw();
     }
 #if defined(CONFIG_SLIM_MENUS) && defined(FEATURE_WAVEFORM)
-    else if (waveform_draw && can_use_raw_overlays())
+    else if (monitoring_enabled(waveform_draw) && can_use_raw_overlays())
     {
         waveform_build_raw_slim();
     }
@@ -609,12 +677,12 @@ hist_build()
     
     if (0
         #ifdef FEATURE_WAVEFORM
-        || (waveform_draw && !waveform_from_raw)
+        || (monitoring_enabled(waveform_draw) && !waveform_from_raw)
         #endif
         #ifdef FEATURE_VECTORSCOPE
         || vectorscope_draw
         #endif
-        || (hist_draw && !histogram.is_raw))
+        || (monitoring_enabled(hist_draw) && !histogram.is_raw))
     {
         /* need to scan YUV buffer for histogram/waveform/vectorscope */
     }
@@ -640,16 +708,17 @@ hist_build()
             int Y = UYVY_GET_AVG_Y(pixel);
             
             #ifdef FEATURE_HISTOGRAM
-            if (hist_draw && !histogram.is_raw)
+            if (monitoring_enabled(hist_draw) && !histogram.is_raw)
             {
                 hist_add_pixel(pixel, Y);
             }
             #endif
             
             #ifdef FEATURE_WAVEFORM
-            if (waveform_draw) 
+            if (monitoring_enabled(waveform_draw)) 
             {
                 waveform_add_pixel(x, Y);
+                waveform_add_clip_pixel(pixel);
             }
             #endif
             
@@ -709,14 +778,35 @@ static void zebra_slim_palette_entry(int color, int base_color,
 
 static void zebra_init_slim_palette(void)
 {
-    /* Higher opacity + chroma so zebras read clearly over LiveView. */
-    zebra_slim_palette_entry(ZEBRA_PAL_CLIP_RGB, COLOR_BLACK,  120, 256, 248);
-    zebra_slim_palette_entry(ZEBRA_PAL_GREEN,    COLOR_GREEN2, 320, 480, 228);
-    zebra_slim_palette_entry(ZEBRA_PAL_CYAN,     COLOR_CYAN,   320, 480, 228);
-    zebra_slim_palette_entry(ZEBRA_PAL_YELLOW,   COLOR_YELLOW, 320, 400, 220);
-    zebra_slim_palette_entry(ZEBRA_PAL_MAGENTA,  COLOR_MAGENTA,320, 400, 220);
-    zebra_slim_palette_entry(ZEBRA_PAL_RED,      COLOR_RED,    340, 420, 220);
-    zebra_slim_palette_entry(ZEBRA_PAL_BLUE,     COLOR_BLUE,   320, 420, 220);
+    /* Performance keeps its existing scan rate, but all RGB clip states use
+     * Precision's darker red palette so zebras have one consistent color. */
+    zebra_slim_palette_entry(ZEBRA_PAL_CLIP_RGB, COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_GREEN,    COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_CYAN,     COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_YELLOW,   COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_MAGENTA,  COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_RED,      COLOR_RED, 210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_BLUE,     COLOR_RED, 210, 300, 120);
+}
+
+static void zebra_init_slim_palette_precision(void)
+{
+    /* Darker, semi-transparent zebras — smoother look, less obstruction. */
+    zebra_slim_palette_entry(ZEBRA_PAL_CLIP_RGB, COLOR_BLACK,  80, 180, 130);
+    zebra_slim_palette_entry(ZEBRA_PAL_GREEN,    COLOR_GREEN2, 180, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_CYAN,     COLOR_CYAN,   180, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_YELLOW,   COLOR_YELLOW, 200, 280, 115);
+    zebra_slim_palette_entry(ZEBRA_PAL_MAGENTA,  COLOR_MAGENTA,200, 280, 115);
+    zebra_slim_palette_entry(ZEBRA_PAL_RED,      COLOR_RED,    210, 300, 120);
+    zebra_slim_palette_entry(ZEBRA_PAL_BLUE,     COLOR_BLUE,   190, 290, 120);
+}
+
+static void zebra_init_slim_palette_for_mode(void)
+{
+    if (monitoring_precision(zebra_draw))
+        zebra_init_slim_palette_precision();
+    else
+        zebra_init_slim_palette();
 }
 #endif
 
@@ -920,6 +1010,15 @@ static int raw_zebra_color_at(int x, int y, int white, int underexposed)
     if (y < raw_info.active_area.y1 || y > raw_info.active_area.y2) return 0;
 
 #ifdef CONFIG_SLIM_MENUS
+    if (monitoring_precision(zebra_draw))
+    {
+        int r = raw_red_pixel_dark(x, y);
+        int g = raw_green_pixel_dark(x, y);
+        int b = raw_blue_pixel_dark(x, y);
+        int u = raw_green_pixel_bright(x, y);
+        return zebra_rgb_solid_color(u <= underexposed, r > white, g > white, b > white);
+    }
+
     struct raw_pixblock * const buf = (void*)raw_info.buffer;
     int ye = (y / 2) * 2;
     int i = (ye * raw_info.width + x) / 8;
@@ -960,7 +1059,7 @@ static void FAST draw_zebras_raw_lv()
 #ifdef CONFIG_SLIM_MENUS
     static int slim_zebra_palette_aux = INT_MIN;
     if (should_run_polling_action(3000, &slim_zebra_palette_aux))
-        zebra_init_slim_palette();
+        zebra_init_slim_palette_for_mode();
 #endif
 
     uint8_t * const bvram = bmp_vram_real();
@@ -973,12 +1072,55 @@ static void FAST draw_zebras_raw_lv()
     int underexposed = zebra_raw_underexposure ? ev_to_raw(- (raw_info.dynamic_range - (zebra_raw_underexposure - 1) * 100) / 100.0) : 0;
 
     int off = get_y_skip_offset_for_overlays();
-    for(int i = os.y0 + off; i < os.y_max - off; i += 2 )
+#ifdef CONFIG_SLIM_MENUS
+    int row_step = monitoring_precision(zebra_draw) ? 1 : 2;
+#else
+    int row_step = 2;
+#endif
+    for(int i = os.y0 + off; i < os.y_max - off; i += row_step )
     {
         int y = BM2RAW_Y(i);
         if (y < raw_info.active_area.y1 || y > raw_info.active_area.y2) continue;
 
 #ifdef CONFIG_SLIM_MENUS
+        if (monitoring_precision(zebra_draw))
+        {
+            int y2 = BM2RAW_Y(i + 1);
+
+            uint32_t * const b_row = (uint32_t*)( bvram        + BM_R(i)   );
+            uint32_t * const m_row = (uint32_t*)( bvram_mirror + BM_R(i)   );
+
+            uint32_t* bp;
+            uint32_t* mp;
+
+            for (int j = os.x0; j < os.x_max; j += 4)
+            {
+                int x = BM2RAW_X(j);
+                if (x < raw_info.active_area.x1 || x > raw_info.active_area.x2) continue;
+
+                bp = b_row + (j >> 2);
+                mp = m_row + (j >> 2);
+
+                #define BP (*bp)
+                #define MP (*mp)
+                #define BN (*(bp + BMPPITCH/4))
+                #define MN (*(mp + BMPPITCH/4))
+
+                if (BP != 0 && BP != MP) { little_cleanup(bp, mp); continue; }
+                if (BN != 0 && BN != MN) { little_cleanup(bp + (BMPPITCH >> 2), mp + (BMPPITCH >> 2)); continue; }
+                if ((MP & 0x80808080) || (MN & 0x80808080)) continue;
+
+                BP = MP = raw_zebra_color_at(x, y, white, underexposed);
+                BN = MN = raw_zebra_color_at(x, y2, white, underexposed);
+
+                #undef MN
+                #undef BN
+                #undef MP
+                #undef BP
+            }
+        }
+        else
+        {
         /* dannephoto-style 8px row writes; alignment comes from lv2raw geometry in raw.c */
         uint64_t * const b_row = (uint64_t*)( bvram        + BM_R(i) );
         uint64_t * const m_row = (uint64_t*)( bvram_mirror + BM_R(i) );
@@ -1014,6 +1156,7 @@ static void FAST draw_zebras_raw_lv()
 
             #undef MP
             #undef BP
+        }
         }
 #else
         int y2 = BM2RAW_Y(i + 1);
@@ -1149,6 +1292,31 @@ static int zebra_rgb_solid_color(int underexposed, int clipR, int clipG, int cli
 #endif
 
 #ifdef FEATURE_WAVEFORM
+static void waveform_draw_clip_points(unsigned x_origin, unsigned y_origin,
+                                      unsigned width, unsigned height,
+                                      unsigned scale)
+{
+    uint32_t threshold = MAX(waveform_clip_total / 100000, 1);
+    int x = x_origin + width + 8;
+    int radius = 5;
+
+    (void) scale;
+    /* Clear only the three former round points. A filled vertical lane made
+     * the external clipping area visibly darker than the rest of the UI. */
+    fill_circle(x, y_origin + height / 4, radius, 0);
+    fill_circle(x, y_origin + height / 2, radius, 0);
+    fill_circle(x, y_origin + height * 3 / 4, radius, 0);
+
+    /* Same circular RGB clip indicators as the histogram, positioned as a
+     * vertical stack just outside the waveform's right border. */
+    if (waveform_clip_r > threshold)
+        fill_circle(x, y_origin + height / 4, radius, COLOR_RED);
+    if (waveform_clip_g > threshold)
+        fill_circle(x, y_origin + height / 2, radius, COLOR_GREEN2);
+    if (waveform_clip_b > threshold)
+        fill_circle(x, y_origin + height * 3 / 4, radius, COLOR_CYAN);
+}
+
 /** Draw the waveform image into the bitmap framebuffer.
  *
  * Draw one pixel at a time; it seems to be ok with err70.
@@ -1160,7 +1328,8 @@ static void
 waveform_draw_image(
     unsigned        x_origin,
     unsigned        y_origin,
-    unsigned        height
+    unsigned        height,
+    unsigned        scale
 )
 {
     if (!waveform) return;
@@ -1176,10 +1345,17 @@ waveform_draw_image(
 
     // Ensure that x_origin is quad-word aligned
     x_origin &= ~3;
+    scale = COERCE(scale, 1, 2);
     
     uint8_t * const bvram = bmp_vram();
     if (!bvram) return;
     unsigned pitch = BMPPITCH;
+    unsigned base_width = WAVEFORM_WIDTH * WAVEFORM_FACTOR;
+    unsigned draw_width = base_width * scale;
+    waveform_touch_x = x_origin;
+    waveform_touch_y = y_origin;
+    waveform_touch_w = draw_width;
+    waveform_touch_h = height;
     if( histogram.max == 0 )
         histogram.max = 1;
 
@@ -1197,7 +1373,7 @@ waveform_draw_image(
             uint8_t * row = bvram + x_origin + y_bmp * pitch;
             //int y_next = (y-1) * height / WAVEFORM_HEIGHT;
             uint32_t pixel = 0;
-            int w = WAVEFORM_WIDTH*WAVEFORM_FACTOR;
+            int w = base_width;
             for( i=0 ; i<w; i++ )
             {
                 uint32_t count = WAVEFORM_UNSAFE( i / WAVEFORM_FACTOR, WAVEFORM_HEIGHT - y - 1);
@@ -1209,14 +1385,24 @@ waveform_draw_image(
                 // Scale to a grayscale
 #ifdef CONFIG_SLIM_MENUS
                 count = (count * 96) >> 7;
-                if( count > 55 )
+                if (monitoring_precision(waveform_draw))
+                {
+                    int y_up = WAVEFORM_HEIGHT - y - 2;
+                    if (y_up >= 0)
+                        count += WAVEFORM_UNSAFE( i / WAVEFORM_FACTOR, y_up);
+                    count /= 2;
+                    count = (count * 88) >> 7;
+                    if( count > 45 )
+                        count = COLOR_RED;
+                    else if( count > 6 )
+                        count = COLOR_WHITE;
+                    else
+                        count = waveform_bg;
+                }
+                else if( count > 55 )
                     count = COLOR_RED;
                 else if( count > 0 )
                     count = COLOR_WHITE;
-                else if( y == (WAVEFORM_HEIGHT*1)>>2 )
-                    count = COLOR_BLUE;
-                else if( y == (WAVEFORM_HEIGHT*3)>>2 )
-                    count = COLOR_BLUE;
                 else
                     count = waveform_bg;
 #else
@@ -1240,19 +1426,28 @@ waveform_draw_image(
                     count = waveform_bg; // transparent
 #endif
 
-                pixel |= (count << ((i & 3)<<3));
+                if (scale == 1)
+                {
+                    pixel |= (count << ((i & 3)<<3));
 
-                if( (i & 3) != 3 )
-                    continue;
+                    if( (i & 3) != 3 )
+                        continue;
 
-                // Draw the pixel, rounding down to the nearest
-                // quad word write (and then nop to avoid err70).
-                *(uint32_t*) ALIGN32(row + i) = pixel;
-                pixel = 0;
+                    // Draw the pixel, rounding down to the nearest
+                    // quad word write (and then nop to avoid err70).
+                    *(uint32_t*) ALIGN32(row + i) = pixel;
+                    pixel = 0;
+                }
+                else
+                {
+                    row[i * scale] = count;
+                    row[i * scale + 1] = count;
+                }
             }
         }
-        bmp_draw_rect(60, x_origin-1, y_origin-1, WAVEFORM_WIDTH*WAVEFORM_FACTOR+1, height+1);
+        bmp_draw_rect(60, x_origin-1, y_origin-1, draw_width+1, height+1);
     }
+    waveform_draw_clip_points(x_origin, y_origin, draw_width, height, scale);
 }
 #endif
 
@@ -1264,6 +1459,8 @@ static void waveform_init()
     if (!waveform)
         waveform = malloc(WAVEFORM_WIDTH * WAVEFORM_HEIGHT);
     bzero32(waveform, WAVEFORM_WIDTH * WAVEFORM_HEIGHT);
+    waveform_clip_r = waveform_clip_g = waveform_clip_b = 0;
+    waveform_clip_total = 0;
 #endif
 }
 
@@ -1390,7 +1587,7 @@ static int zebra_digic_dirty = 0;
 static void draw_zebras( int Z )
 {
     uint8_t * const bvram = bmp_vram_real();
-    int zd = Z && zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
+    int zd = Z && monitoring_enabled(zebra_draw) && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
     if (zd)
     {
         #ifdef FEATURE_RAW_ZEBRAS
@@ -1991,7 +2188,7 @@ draw_zebra_and_focus( int Z, int F )
             #undef M2
         }
         dirty_pixels_num = 0;
-        
+
         uint32_t vram = (uint32_t)CACHEABLE(YUV422_LV_BUFFER_DISPLAY_ADDR);
         if (!vram) return 0;
         
@@ -2151,6 +2348,12 @@ clrscr_mirror( void )
     }
 }
 
+#ifdef CONFIG_SLIM_MENUS
+static MENU_UPDATE_FUNC(monitoring_mode_display)
+{
+    MENU_SET_VALUE("%s", CURRENT_VALUE ? "ON" : "OFF");
+}
+#endif
 #ifdef FEATURE_ZEBRA
 static MENU_UPDATE_FUNC(zebra_draw_display)
 {
@@ -2267,7 +2470,7 @@ static void focus_peaking_adjust_thr(void* priv, int delta)
 #ifdef FEATURE_WAVEFORM
 static MENU_UPDATE_FUNC(waveform_print)
 {
-    if (waveform_draw)
+    if (monitoring_enabled(waveform_draw))
         MENU_SET_VALUE(
             waveform_size == 0 ? "Small" : 
             waveform_size == 1 ? "Large" : 
@@ -2937,12 +3140,13 @@ struct menu_entry zebra_menus[] = {
     {
         .name = "Zebras",
         .priv       = &zebra_draw,
-        .max = 1,
-        .icon_type = IT_BOOL,
+        .max = MONITOR_PERFORMANCE,
+        .icon_type = IT_DICE,
         .choices = CHOICES("OFF", "ON"),
+        .update     = monitoring_mode_display,
         .edit_mode = EM_INLINE_ADJUST,
         .help = "RAW RGB zebras: per-channel clip colors from sensor data.",
-        .help2 = "Dial L/R toggles ON/OFF.",
+        .help2 = "Off: disabled. On: performance overlay.",
     },
 #else
     {
@@ -3033,7 +3237,45 @@ struct menu_entry zebra_menus[] = {
         .choices = CHOICES("OFF", "ON"),
         .edit_mode = EM_INLINE_ADJUST,
         .help = "Show which parts of the image are in focus.",
-        .help2 = "Dial L/R toggles ON/OFF.",
+        .help2 = "Dial L/R toggles ON/OFF. SET opens tuning options.",
+        .submenu_width = 650,
+        .children =  (struct menu_entry[]) {
+            {
+                .name = "Filter bias",
+                .priv = &focus_peaking_filter_edges,
+                .max = 2,
+                .choices = (const char *[]) {"Strong edges", "Balanced", "Fine details"},
+                .help  = "Fine-tune the focus detection algorithm:",
+                .help2 = "Strong edges: looks for edges, works best in low light.\n"
+                         "Balanced: tries to cover both strong edges and fine details.\n"
+                         "Fine details: looks for microcontrast. Needs lots of light.\n",
+                .icon_type = IT_DICE,
+            },
+            {
+                .name = "Threshold",
+                .priv = &focus_peaking_pthr,
+                .select = focus_peaking_adjust_thr,
+                .max    = 50,
+                .icon_type = IT_PERCENT_LOG,
+                .unit = UNIT_PERCENT_x10,
+                .help = "How many pixels are considered in focus (percentage).",
+            },
+            {
+                .name = "Color",
+                .priv = &focus_peaking_color,
+                .max = 7,
+                .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Global Focus", "Local Focus"},
+                .help = "Focus peaking color (fixed or color coding).",
+                .icon_type = IT_DICE,
+            },
+            {
+                .name = "Grayscale image",
+                .priv = &focus_peaking_grayscale,
+                .max = 1,
+                .help = "Display LiveView image in grayscale.",
+            },
+            MENU_EOL
+        },
     },
 #else
     {
@@ -3314,12 +3556,13 @@ struct menu_entry zebra_menus[] = {
     {
         .name = "Histogram",
         .priv       = &hist_draw,
-        .max = 1,
-        .icon_type = IT_BOOL,
+        .max = MONITOR_PERFORMANCE,
+        .icon_type = IT_DICE,
         .choices = CHOICES("OFF", "ON"),
+        .update     = monitoring_mode_display,
         .edit_mode = EM_INLINE_ADJUST,
         .help = "RAW luma histogram on a linear scale.",
-        .help2 = "Dial L/R toggles ON/OFF. Clip dots warn when channels clip.",
+        .help2 = "Off: disabled. On: performance refresh.",
     },
 #else
     {
@@ -3388,12 +3631,13 @@ struct menu_entry zebra_menus[] = {
     {
         .name = "Waveform",
         .priv       = &waveform_draw,
-        .max = 1,
-        .icon_type = IT_BOOL,
+        .max = MONITOR_PERFORMANCE,
+        .icon_type = IT_DICE,
         .choices = CHOICES("OFF", "ON"),
+        .update     = monitoring_mode_display,
         .edit_mode = EM_INLINE_ADJUST,
         .help = "RAW luma waveform (same scale as histogram).",
-        .help2 = "Dial L/R toggles ON/OFF.",
+        .help2 = "Off: disabled. On: performance refresh.",
     },
 #else
     {
@@ -3944,8 +4188,25 @@ int zebra_should_run()
 
 int zebra_draw_enabled(void)
 {
-    return zebra_draw;
+    return monitoring_enabled(zebra_draw);
 }
+
+#ifdef CONFIG_SLIM_MENUS
+int monitoring_hist_menu_countdown(void)
+{
+    int cd = 3;
+    if (monitoring_enabled(hist_draw) && monitoring_precision(hist_draw))
+        cd = 1;
+    if (monitoring_enabled(waveform_draw) && monitoring_precision(waveform_draw))
+        cd = MIN(cd, 1);
+    return cd;
+}
+
+int monitoring_slim_precision_scan(void)
+{
+    return monitoring_precision(hist_draw) || monitoring_precision(waveform_draw);
+}
+#endif
 
 #ifdef FEATURE_OVERLAYS_IN_PLAYBACK_MODE
 static int overlays_playback_running = 0;
@@ -4039,6 +4300,9 @@ int should_draw_bottom_graphs()
 
 void draw_histogram_and_waveform(int allow_play)
 {
+#ifdef CONFIG_SLIM_MENUS
+    if (menu_white_card_wb_is_active()) return;
+#endif
 
     if (menu_active_and_not_hidden()) return;
     if (!get_global_draw()) return;
@@ -4047,8 +4311,8 @@ void draw_histogram_and_waveform(int allow_play)
 
 #if defined(FEATURE_HISTOGRAM) || defined(FEATURE_WAVEFORM) || defined(FEATURE_VECTORSCOPE)
     if (0
-        || hist_draw
-        || waveform_draw
+        || monitoring_enabled(hist_draw)
+        || monitoring_enabled(waveform_draw)
 #if defined(FEATURE_VECTORSCOPE)
         || vectorscope_should_draw()
 #endif
@@ -4064,24 +4328,30 @@ void draw_histogram_and_waveform(int allow_play)
     if (is_zoom_mode_so_no_zebras()) return;
 
     int screen_layout = get_screen_layout();
+    int hist_scale = histogram_touch_scale();
+    int waveform_scale = waveform_touch_expanded ? 2 : 1;
 
 #ifdef FEATURE_HISTOGRAM
-    if( hist_draw && !WAVEFORM_FULLSCREEN)
+    if( monitoring_enabled(hist_draw) && !WAVEFORM_FULLSCREEN)
     {
         extern int console_visible;
         #ifdef CONFIG_4_3_SCREEN
         if (PLAY_OR_QR_MODE)
-            BMP_LOCK( hist_draw_image( os.x0 + 500,  1); )
+            BMP_LOCK( hist_draw_image( os.x0 + 500,  1, hist_scale); )
         else
         #endif
         if (should_draw_bottom_graphs())
-            BMP_LOCK( hist_draw_image( os.x0 + 50,  480 - hist_height - 1); )
+            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH * hist_scale - 4,
+                                       480 - hist_height * hist_scale, hist_scale); )
         else if (console_visible)
-            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH - 5, os.y0 + 70); )
+            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH * hist_scale - 5,
+                                       os.y0 + 70, hist_scale); )
         else if (screen_layout == SCREENLAYOUT_3_2)
-            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH - 2,  os.y_max - (lv ? os.off_169 + 10 : 0) - hist_height - 1); )
+            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH * hist_scale - 2,
+                                       os.y_max - (lv ? os.off_169 + 10 : 0) - hist_height * hist_scale - 1, hist_scale); )
         else
-            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH - 5, os.y0 + 100); )
+            BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH * hist_scale - 5,
+                                       os.y0 + 100, hist_scale); )
     }
 #endif
 
@@ -4091,24 +4361,33 @@ void draw_histogram_and_waveform(int allow_play)
     if (is_zoom_mode_so_no_zebras()) return;
         
 #ifdef FEATURE_WAVEFORM
-    if (waveform_draw)
+    if (monitoring_enabled(waveform_draw))
     {
         #ifdef CONFIG_4_3_SCREEN
         if (PLAY_OR_QR_MODE && WAVEFORM_FACTOR == 1)
-            BMP_LOCK( waveform_draw_image( os.x0 + 100,  1, 54); )
+            BMP_LOCK( waveform_draw_image( os.x0 + 100,  1,
+                                            54 * waveform_scale, waveform_scale); )
         else
         #endif
         if (should_draw_bottom_graphs() && WAVEFORM_FACTOR == 1)
-            BMP_LOCK( waveform_draw_image( os.x0 + 250,  480 - 54, 54); )
+            BMP_LOCK( waveform_draw_image( os.x0 + 4,
+                                            480 - 54 * waveform_scale,
+                                            54 * waveform_scale, waveform_scale); )
         else if (screen_layout == SCREENLAYOUT_3_2 && !WAVEFORM_FULLSCREEN)
         {
             if (WAVEFORM_FACTOR == 1)
-                BMP_LOCK( waveform_draw_image( os.x0 + 4, os.y_max - (lv ? os.off_169 : 0) - (gui_menu_shown() ? 25 : 0) - 54, 54); )
+                BMP_LOCK( waveform_draw_image( os.x0 + 4,
+                                                os.y_max - (lv ? os.off_169 : 0) - (gui_menu_shown() ? 25 : 0) - 54 * waveform_scale,
+                                                54 * waveform_scale, waveform_scale); )
             else
-                BMP_LOCK( waveform_draw_image( os.x_max - WAVEFORM_WIDTH*WAVEFORM_FACTOR - 4, os.y0 + 100, WAVEFORM_HEIGHT*WAVEFORM_FACTOR ); );
+                BMP_LOCK( waveform_draw_image( os.x0 + 4,
+                                                os.y_max - WAVEFORM_HEIGHT * WAVEFORM_FACTOR * waveform_scale - WAVEFORM_OFFSET,
+                                                WAVEFORM_HEIGHT * WAVEFORM_FACTOR * waveform_scale, waveform_scale ); );
         }
         else
-            BMP_LOCK( waveform_draw_image( os.x_max - WAVEFORM_WIDTH*WAVEFORM_FACTOR - (WAVEFORM_FULLSCREEN ? 0 : 4), os.y_max - WAVEFORM_HEIGHT*WAVEFORM_FACTOR - WAVEFORM_OFFSET, WAVEFORM_HEIGHT*WAVEFORM_FACTOR ); )
+            BMP_LOCK( waveform_draw_image( os.x0 + (WAVEFORM_FULLSCREEN ? 0 : 4),
+                                            os.y_max - WAVEFORM_HEIGHT * WAVEFORM_FACTOR * waveform_scale - WAVEFORM_OFFSET,
+                                            WAVEFORM_HEIGHT * WAVEFORM_FACTOR * waveform_scale, waveform_scale ); )
     }
 #endif
 
@@ -4189,7 +4468,8 @@ clearscreen_loop:
         
         #ifdef FEATURE_CROPMARKS
         // since this task runs at 10Hz, I prefer cropmark redrawing here
-        cropmark_step();
+        if (!menu_white_card_wb_is_active())
+            cropmark_step();
         #endif
     }
 }
@@ -4357,7 +4637,21 @@ livev_hipriority_task( void* unused )
             msleep(100);
         }
 
-        int zd = zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras (should match the one from draw_zebra_and_focus)
+#ifdef CONFIG_SLIM_MENUS
+        /* This is an exclusive calibration screen. Leave its bitmap pixels
+         * untouched while it is active; repainting the RBF text every frame
+         * was itself visible as flicker. Live View continues underneath. */
+        if (menu_white_card_wb_is_active())
+        {
+            /* Keep all white-card bitmap access in this renderer. Timer and
+             * input callbacks only request a paint or clear operation. */
+            BMP_LOCK(menu_white_card_wb_render_step();)
+            msleep(20);
+            continue;
+        }
+#endif
+
+        int zd = monitoring_enabled(zebra_draw) && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras (should match the one from draw_zebra_and_focus)
         if (!zd) digic_zebra_cleanup();
         
 #ifdef CONFIG_RAW_LIVEVIEW
@@ -4411,11 +4705,11 @@ livev_hipriority_task( void* unused )
             /* 70D has problems with RAW zebras */
             /* ToDo: Adjust with appropriate internals-config: CONFIG_NO_RAW_ZEBRAS */
             #if !defined(CONFIG_70D)
-            if (zebra_draw && raw_zebra_enable == 1) raw_needed = 1;        /* raw zebras: always */
+            if (monitoring_enabled(zebra_draw) && raw_zebra_enable == 1) raw_needed = 1;        /* raw zebras: always */
             #endif            
-            if (hist_draw && RAW_HISTOGRAM_ENABLED) raw_needed = 1;          /* raw hisogram (any kind) */
+            if (monitoring_enabled(hist_draw) && RAW_HISTOGRAM_ENABLED) raw_needed = 1;          /* raw hisogram (any kind) */
 #ifdef CONFIG_SLIM_MENUS
-            if (waveform_draw) raw_needed = 1;                               /* slim waveform uses raw scan */
+            if (monitoring_enabled(waveform_draw)) raw_needed = 1;                               /* slim waveform uses raw scan */
 #endif
             if (spotmeter_draw && spotmeter_formula == 3) raw_needed = 1;   /* spotmeter, units: raw */
         }
@@ -4533,12 +4827,20 @@ livev_hipriority_task( void* unused )
                 if (lens_display_dirty) lens_display_dirty--;
             }
         }
+
     }
 }
 
 static void loprio_sleep()
 {
+#ifdef CONFIG_SLIM_MENUS
+    int fast_refresh =
+        (monitoring_enabled(hist_draw) && monitoring_precision(hist_draw)) ||
+        (monitoring_enabled(waveform_draw) && monitoring_precision(waveform_draw));
+    msleep(fast_refresh ? 100 : 200);
+#else
     msleep(200);
+#endif
     while (is_mvr_buffer_almost_full()) msleep(100);
 }
 
@@ -4600,12 +4902,12 @@ void update_disp_mode_bits_from_params()
 //~ BMP_LOCK(
     uint32_t bits =
         (global_draw & 1      ? 1<<0 : 0) |
-        (zebra_draw           ? 1<<1 : 0) |
+        (monitoring_enabled(zebra_draw) ? 1<<1 : 0) |
 #ifdef FEATURE_HISTOGRAM
-        (hist_draw            ? 1<<2 : 0) |
+        (monitoring_enabled(hist_draw)  ? 1<<2 : 0) |
 #endif
         (crop_enabled         ? 1<<3 : 0) |
-        (waveform_draw        ? 1<<4 : 0) |
+        (monitoring_enabled(waveform_draw) ? 1<<4 : 0) |
         (falsecolor_draw      ? 1<<5 : 0) |
         (spotmeter_draw       ? 1<<6 : 0) |
         (global_draw & 2      ? 1<<7 : 0) |
@@ -4817,7 +5119,10 @@ static void zebra_init()
     hist_log = 0;
     hist_meter = 0;
     hist_warn = 1; /* slim has no Clip warning menu; dots always follow histogram */
-    zebra_init_slim_palette();
+    if (zebra_draw > MONITOR_PERFORMANCE) zebra_draw = MONITOR_PERFORMANCE;
+    if (hist_draw > MONITOR_PERFORMANCE) hist_draw = MONITOR_PERFORMANCE;
+    if (waveform_draw > MONITOR_PERFORMANCE) waveform_draw = MONITOR_PERFORMANCE;
+    zebra_init_slim_palette_for_mode();
 #endif
     precompute_yuv2rgb();
     menu_add( "Overlay", zebra_menus, COUNT(zebra_menus) );

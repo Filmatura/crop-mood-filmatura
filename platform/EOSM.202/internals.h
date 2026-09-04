@@ -112,8 +112,7 @@
 #define CONFIG_NO_ADDITIONAL_VERSION
 
 /** Touchscreen support **/
-// Disabled on EOS M slim — no ML touch hook; investigate separately.
-//#define CONFIG_TOUCHSCREEN
+#define CONFIG_TOUCHSCREEN
 
 /** Intermediate "x1" zoom, before going into x5/x10 (what's the point?!) */
 #define CONFIG_ZOOM_X1

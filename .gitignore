@@ -69,4 +69,7 @@ platform/*/EOSM_202.sym
 zip/
 magiclantern-*.zip
 tags
+platform/*/*.a
+platform/*/newlib-libm.a
+modules/mlv_play/video.bmp.rsc
 .github/workflows/

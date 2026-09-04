@@ -573,6 +573,65 @@ void bmp_draw_rect_chamfer(int color, int x0, int y0, int w, int h, int a, int t
     }
 }
 
+/* Draw a small fixed-footprint triangle with softened edge pixels.  The
+ * geometry intentionally matches the existing integer line arrows; only the
+ * outermost pixels use a nearby palette color, so anchors and hitboxes stay
+ * unchanged. direction: 0=left, 1=right, 2=up, 3=down. */
+void bmp_draw_antialiased_triangle(int tip_x, int tip_y, int direction,
+                                   int depth, int height, int color)
+{
+    uint8_t * const vram = bmp_vram();
+    int edge;
+    int half;
+
+    if (!vram || depth < 1 || height < 1)
+        return;
+
+    edge = color == COLOR_ORANGE ? COLOR_DARK_ORANGE_MOD :
+           color == COLOR_WHITE ? COLOR_ALMOST_WHITE :
+           color == COLOR_GRAY(50) ? COLOR_GRAY(70) : color;
+    half = MAX(height / 2, 1);
+
+    if (direction == 0 || direction == 1)
+    {
+        for (int row = -half; row <= half; row++)
+        {
+            int span = depth * (half - ABS(row)) / half;
+            int start = direction == 0
+                ? tip_x + depth - span : tip_x - depth;
+            int end = direction == 0
+                ? tip_x + depth : tip_x - depth + span;
+            int y = tip_y + row;
+
+            for (int x = MIN(start, end); x <= MAX(start, end); x++)
+            {
+                if (x < BMP_W_MINUS || x >= BMP_W_PLUS ||
+                    y < BMP_H_MINUS || y >= BMP_H_PLUS)
+                    continue;
+                bmp_putpixel_fast(vram, x, y,
+                    (x == MIN(start, end) || x == MAX(start, end))
+                        ? edge : color);
+            }
+        }
+        return;
+    }
+
+    for (int row = 0; row <= height; row++)
+    {
+        int span = depth * row / height;
+        int y = direction == 2 ? tip_y + row : tip_y - row;
+
+        for (int x = tip_x - span; x <= tip_x + span; x++)
+        {
+            if (x < BMP_W_MINUS || x >= BMP_W_PLUS ||
+                y < BMP_H_MINUS || y >= BMP_H_PLUS)
+                continue;
+            bmp_putpixel_fast(vram, x, y,
+                (x == tip_x - span || x == tip_x + span) ? edge : color);
+        }
+    }
+}
+
 #ifdef CONFIG_VXWORKS
 
 /** converting dryos palette to vxworks one */

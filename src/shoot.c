@@ -46,6 +46,7 @@
 #include "fps.h"
 #include "lvinfo.h"
 #include "powersave.h"
+#include "menu-grid.h"
 
 #ifdef FEATURE_LCD_SENSOR_REMOTE
 #include "lcdsensor.h"
@@ -56,6 +57,23 @@
 #include "battery.h"
 #include "tskmon.h"
 #include "module.h"
+
+#ifdef CONFIG_SLIM_MENUS
+#include "../modules/dual_iso/dual_iso.h"
+static int (*dual_iso_is_enabled_fn)() = MODULE_FUNCTION(dual_iso_is_enabled);
+static int (*dual_iso_slim_step_pair_fn)(int) = MODULE_FUNCTION(dual_iso_slim_step_pair);
+
+static int slim_dual_iso_step_pair(int sign)
+{
+    if (!dual_iso_is_enabled_fn || !dual_iso_is_enabled_fn())
+        return 0;
+
+    if (!dual_iso_slim_step_pair_fn)
+        return 0;
+
+    return dual_iso_slim_step_pair_fn(sign > 0 ? 1 : -1);
+}
+#endif
 
 static struct recursive_lock * shoot_task_rlock = NULL;
 
@@ -1537,15 +1555,22 @@ static MENU_UPDATE_FUNC(iso_icon_update)
 static MENU_UPDATE_FUNC(iso_display)
 {
 #ifdef CONFIG_SLIM_MENUS
+    /* The INFO shortcut changes this config directly; read the same source
+     * so menu and Quick Panel update immediately after either path. */
+    int dual_iso = get_config_var("isoless.hdr") > 0;
     if (!lens_info.iso)
     {
         MENU_SET_VALUE("100");
-        MENU_SET_ENABLED(1);
+        MENU_SET_ENABLED(!dual_iso);
+        if (dual_iso)
+            MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Disable Dual ISO to adjust ISO.");
         MENU_SET_SHORT_NAME(" ");
         return;
     }
     MENU_SET_VALUE("%d", raw2iso(lens_info.iso_equiv_raw));
-    MENU_SET_ENABLED(1);
+    MENU_SET_ENABLED(!dual_iso);
+    if (dual_iso)
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Disable Dual ISO to adjust ISO.");
     MENU_SET_SHORT_NAME(" ");
 #else
     MENU_SET_VALUE(
@@ -1685,6 +1710,10 @@ void
 iso_toggle( void * priv, int sign )
 {
 #ifdef CONFIG_SLIM_MENUS
+    /* Dual ISO ON: UP/DOWN steps both ISOs as a pair (100/200 .. 800/1600). */
+    if (slim_dual_iso_step_pair(sign))
+        return;
+
     int (*iso_checker)(int) = is_slim_menu_iso;
 
     /* Auto or non-list value: land on ISO 100 (or 6400 when dialing down from junk). */
@@ -1746,6 +1775,10 @@ iso_toggle( void * priv, int sign )
 #endif // FEATURE_EXPO_ISO
 
 #ifdef FEATURE_EXPO_SHUTTER
+
+#ifdef CONFIG_EOSM
+extern void shutter_lock_accept(int shutter);
+#endif
 
 static MENU_UPDATE_FUNC(shutter_display)
 {
@@ -1826,7 +1859,13 @@ shutter_toggle(void* priv, int sign)
         i = new_i;
         if (codes_shutter[i] == 0) continue;
         if (is_movie_mode() && codes_shutter[i] < SHUTTER_1_25) { k--; continue; }  /* there are many values to skip */
-        if (lens_set_rawshutter(codes_shutter[i])) break;
+        if (lens_set_rawshutter(codes_shutter[i]))
+        {
+#ifdef CONFIG_EOSM
+            shutter_lock_accept(codes_shutter[i]);
+#endif
+            break;
+        }
     }
 }
 
@@ -1843,8 +1882,8 @@ static MENU_UPDATE_FUNC(aperture_display)
 #ifdef CONFIG_SLIM_MENUS
     /* Slim Exposure: bare number (e.g. 3.5), no f/ prefix. */
     MENU_SET_VALUE("%d.%d", a / 10, a % 10);
-    /* Never grey Aperture on slim Exposure. */
-    MENU_SET_ENABLED(1);
+    /* A zero aperture means the lens is automatic or unavailable. */
+    MENU_SET_ENABLED(a != 0);
 #else
     MENU_SET_VALUE(
         SYM_F_SLASH"%d.%d",
@@ -2008,6 +2047,24 @@ static MENU_UPDATE_FUNC(kelvin_wbs_display)
 
 static int kelvin_auto_flag = 0;
 static int wbs_gm_auto_flag = 0;
+static int white_card_wb_sample_active = 0;
+
+void white_card_wb_auto_start()
+{
+    if (lv)
+    {
+        /* Custom/preset WB may leave Kelvin unset or stale. Start the solver
+         * from a known valid midpoint; it will immediately measure and refine
+         * this value from the white-card box. */
+        if (lens_info.wb_mode != WB_KELVIN ||
+            lens_info.kelvin < KELVIN_MIN || lens_info.kelvin > KELVIN_MAX)
+            lens_set_kelvin(5500);
+        /* The Quick Panel guide is centered at x=360, y=240. */
+        white_card_wb_sample_active = 1;
+        kelvin_auto_flag = 1;
+        wbs_gm_auto_flag = 1;
+    }
+}
 static void kelvin_auto()
 {
     if (lv) kelvin_auto_flag = 1;
@@ -2075,12 +2132,16 @@ static int crit_kelvin(int k)
     }
 
     int Y, U, V;
-    get_spot_yuv(100, &Y, &U, &V);
+    if (white_card_wb_sample_active)
+        get_spot_yuv_ex(34, 0, 0, &Y, &U, &V, 0, 0);
+    else
+        get_spot_yuv(100, &Y, &U, &V);
 
     int R,G,B;
     yuv2rgb(Y,U,V,&R,&G,&B);
     
-    NotifyBox(5000, "Adjusting white balance...");
+    if (!white_card_wb_sample_active)
+        NotifyBox(5000, "Adjusting white balance...");
 
     return B - R;
 }
@@ -2094,12 +2155,16 @@ static int crit_wbs_gm(int k)
     msleep(750);
 
     int Y, U, V;
-    get_spot_yuv(100, &Y, &U, &V);
+    if (white_card_wb_sample_active)
+        get_spot_yuv_ex(34, 0, 0, &Y, &U, &V, 0, 0);
+    else
+        get_spot_yuv(100, &Y, &U, &V);
 
     int R,G,B;
     yuv2rgb(Y,U,V,&R,&G,&B);
 
-    NotifyBox(5000, "Adjusting white balance shift...");
+    if (!white_card_wb_sample_active)
+        NotifyBox(5000, "Adjusting white balance shift...");
 
     //~ BMP_LOCK( draw_ml_bottombar(0,0); )
     return (R+B)/2 - G;
@@ -4678,6 +4743,11 @@ static struct menu_entry expo_menus[] = {
     #endif
 
     MENU_PLACEHOLDER("Dual ISO"),
+#ifdef CONFIG_SLIM_MENUS
+#ifdef FEATURE_EXPO_OVERRIDE
+    MENU_PLACEHOLDER("Expo Override"),
+#endif
+#endif
 };
 
 #ifndef CONFIG_SLIM_MENUS
@@ -6063,6 +6133,8 @@ shoot_task( void* unused )
         {
             wbs_gm_auto_run();
             wbs_gm_auto_flag = 0;
+            menu_white_card_wb_capture_finished();
+            white_card_wb_sample_active = 0;
         }
         #endif
         
@@ -6762,7 +6834,7 @@ static void shoot_init()
     
     //~ menu_add( "Tweaks", vid_menus, COUNT(vid_menus) );
 
-    #if defined(FEATURE_EXPO_OVERRIDE) && !defined(CONFIG_SLIM_MENUS)
+    #if defined(FEATURE_EXPO_OVERRIDE)
     extern struct menu_entry expo_override_menus[];
     menu_add( "Expo", expo_override_menus, 1 );
     #endif

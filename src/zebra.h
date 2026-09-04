@@ -18,6 +18,40 @@ int zebra_should_run();
 /* returns true if zebra overlay is enabled in menu */
 int zebra_draw_enabled(void);
 
+#ifdef CONFIG_SLIM_MENUS
+#define MONITOR_OFF         0
+#define MONITOR_PERFORMANCE 1
+/* Kept for compatibility with older saved configs; slim menus no longer
+ * expose a precision mode and all non-zero values use performance sampling. */
+#define MONITOR_PRECISION   2
+
+static inline int monitoring_enabled(int mode) { return mode != MONITOR_OFF; }
+static inline int monitoring_precision(int mode) { (void) mode; return 0; }
+
+/* Initial hist/waveform refresh countdown while Monitoring menu is transparent. */
+int monitoring_hist_menu_countdown(void);
+/** True when slim RAW scan should use precision sampling (hist and/or waveform). */
+int monitoring_slim_precision_scan(void);
+/** Toggle monitoring tool between OFF and ON (INFO button). */
+static inline void monitoring_toggle_tool(int *mode)
+{
+    if (!mode) return;
+    *mode = monitoring_enabled(*mode) ? MONITOR_OFF : MONITOR_PERFORMANCE;
+}
+#else
+static inline int monitoring_enabled(int mode) { return mode; }
+static inline int monitoring_precision(int mode) { return 0; }
+static inline void monitoring_toggle_tool(int *mode)
+{
+    if (!mode) return;
+    *mode = *mode ? 0 : 1;
+}
+#endif
+
+#ifdef FEATURE_WAVEFORM
+extern int waveform_draw;
+#endif
+
 /* returns true if the setting is enabled (does not check preconditions) */
 int get_global_draw_setting();
 
@@ -35,6 +69,8 @@ int get_disp_mode();
 void draw_histogram_and_waveform(int allow_play);
 int histogram_or_small_waveform_enabled();
 int should_draw_bottom_graphs();
+int monitoring_graph_touch_toggle(int x, int y);
+void monitoring_graph_clear_region(int x, int y, int w, int h);
 
 /* true if should draw Magic Zoom (setting + preconditions) */
 int should_draw_zoom_overlay();

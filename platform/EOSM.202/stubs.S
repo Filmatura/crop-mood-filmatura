@@ -270,6 +270,7 @@ NSTUB(0xFF2C5EB4,  UnLockEngineResources)
 NSTUB(0xFFA6FEE8 - RAM_OFFSET,  create_named_semaphore)
 NSTUB(0xFFA70134 - RAM_OFFSET,  give_semaphore)
 NSTUB(0xFFA70048 - RAM_OFFSET,  take_semaphore)
+NSTUB(0xFFA6FFF0 - RAM_OFFSET,  take_semaphore_now)
 
 /** Task info **/
 NSTUB(   0x3F14C,  task_max)

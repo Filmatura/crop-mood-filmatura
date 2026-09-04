@@ -3029,6 +3029,7 @@ static LVINFO_UPDATE_FUNC(wb_update)
         );
     }
     
+#ifndef CONFIG_SLIM_MENUS
     int gm = lens_info.wbs_gm;
     int ba = lens_info.wbs_ba;
     
@@ -3050,6 +3051,7 @@ static LVINFO_UPDATE_FUNC(wb_update)
     {
         STR_APPEND(buffer, "%s%d", ba > 0 ? "A" : "B", ABS(ba));
     }
+#endif
 }
 
 /* in focus.c */

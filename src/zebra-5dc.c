@@ -77,6 +77,10 @@ int get_zoom_overlay_trigger_mode() { return 0; }
 void zoom_overlay_set_countdown(){}
 int lv_luma_is_accurate() { return 1; }
 int should_draw_bottom_graphs() { return 0; }
+void monitoring_graph_clear_region(int x, int y, int w, int h)
+{
+    bmp_fill(0, x, y, w, h);
+}
 void bmp_mute_flag_reset(){}
 void PauseLiveView(){};
 void ResumeLiveView(){};
@@ -2006,7 +2010,7 @@ void draw_histogram_and_waveform(int allow_play)
 
     if( hist_draw )
     {
-        BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH - 5, os.y0 + 100, -1); )
+        BMP_LOCK( hist_draw_image( os.x_max - HIST_WIDTH - 5, os.y0 + 100, 1); )
     }
 
     if( waveform_draw)

@@ -11,17 +11,11 @@
 #include "dryos.h"
 //#include <errno.h>
 
-// Don't use strcmp since we don't have it
-int
-streq( const char * a, const char * b )
+int streq(const char *a, const char *b)
 {
     ASSERT(a);
     ASSERT(b);
-
-    while( *a && *b )
-        if( *a++ != *b++ )
-            return 0;
-    return *a == *b;
+    return strcmp(a, b) == 0;
 }
 
 int toupper(int c)
