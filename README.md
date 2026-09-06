@@ -10,8 +10,7 @@ official firmware.
 Magic Lantern is not a *hack*, or a modified firmware, **it is an
 independent program that runs alongside Canon's own software**. 
 Each time you start your camera, Magic Lantern is loaded from your memory
-card. Our only modification was to enable the ability to run software
-from the memory card.
+card.
 
 ML is being developed by photo and video enthusiasts, adding
 functionality such as: HDR images and video, timelapse, motion
