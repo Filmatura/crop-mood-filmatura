@@ -126,10 +126,16 @@ static int boot_logo_selected = 0;
 /* A batch of pixel rows, read in one FIO_ReadFile call rather than one call
  * per row -- 480 tiny sequential reads this early in boot (before the card
  * is necessarily up to full transfer speed) was slow enough to blow past
- * the splash's display budget. Too big for boot_logo_task's small stack
- * (see task_create below), so it's static instead. */
+ * the splash's display budget.
+ *
+ * Must come from fio_malloc(), not a plain static/stack array: FIO_ReadFile
+ * silently routes any read into ordinary cacheable memory through a
+ * small-buffer workaround (alloc a temp DMA buffer, read into that, memcpy
+ * out) that's hard-capped at 8192 bytes -- ASSERT(count <= 8192) in
+ * fio-ml.c. A batch this size (up to 720*3*16 = 34560 bytes) blew straight
+ * through that on real hardware. fio_malloc's buffer is already DMA-safe,
+ * so FIO_ReadFile takes the direct path instead and the cap doesn't apply. */
 #define BOOT_LOGO_CUSTOM_ROWS_PER_READ 16
-static uint8_t boot_logo_custom_rows[BOOT_LOGO_CUSTOM_W * 3 * BOOT_LOGO_CUSTOM_ROWS_PER_READ];
 
 /* Returns 1 if a valid file was found and fully drawn, 0 otherwise (caller
  * falls back to a plain black screen -- boot_logo_draw already cleared it). */
@@ -156,7 +162,9 @@ static int boot_logo_draw_custom(void)
          * spec), not a real pointer -- see bmp_load_ram() for precedent. */
         uint32_t data_offset = (uint32_t)(uintptr_t) hdr.image;
 
-        if (height == BOOT_LOGO_CUSTOM_H &&
+        uint8_t *rows_buf = fio_malloc(BOOT_LOGO_CUSTOM_W * 3 * BOOT_LOGO_CUSTOM_ROWS_PER_READ);
+
+        if (rows_buf && height == BOOT_LOGO_CUSTOM_H &&
             FIO_SeekSkipFile(f, data_offset, SEEK_SET) == data_offset)
         {
             /* 8bpp: a pre-quantized indexed BMP, e.g. from the installer's
@@ -183,14 +191,14 @@ static int boot_logo_draw_custom(void)
             {
                 int rows_this_batch = MIN(BOOT_LOGO_CUSTOM_ROWS_PER_READ, BOOT_LOGO_CUSTOM_H - row);
                 int batch_bytes = rows_this_batch * row_bytes;
-                if (FIO_ReadFile(f, boot_logo_custom_rows, batch_bytes) != batch_bytes)
+                if (FIO_ReadFile(f, rows_buf, batch_bytes) != batch_bytes)
                 {
                     ok = 0;
                     break;
                 }
                 for (int i = 0; i < rows_this_batch; i++)
                 {
-                    uint8_t *src = boot_logo_custom_rows + i * row_bytes;
+                    uint8_t *src = rows_buf + i * row_bytes;
                     /* BMP rows are bottom-up unless height was negative. */
                     int y = top_down ? (row + i) : (BOOT_LOGO_CUSTOM_H - 1 - (row + i));
 
@@ -212,6 +220,9 @@ static int boot_logo_draw_custom(void)
                 }
             }
         }
+
+        if (rows_buf)
+            fio_free(rows_buf);
     }
 
     FIO_CloseFile(f);
