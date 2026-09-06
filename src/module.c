@@ -59,7 +59,20 @@ static int module_load_symbols(TCCState *s, char *filename)
     uint32_t count = 0;
     uint32_t pos = 0;
 
-    if( FIO_GetFileSize( filename, &size ) != 0 )
+    /* On a freshly-formatted card, the very first FIO_GetFileSize call for
+     * this file can fail even though it's genuinely there and unchanged --
+     * a cold filesystem-cache miss this early in boot, not a missing file.
+     * A plain reboot with the same card and files always succeeds, which is
+     * the signature of a one-shot timing issue rather than a real error, so
+     * retry briefly before giving up (all modules fail to load otherwise,
+     * since this is the very first thing module loading depends on). */
+    int found = 0;
+    for (int attempt = 0; attempt < 5; attempt++)
+    {
+        if (FIO_GetFileSize(filename, &size) == 0) { found = 1; break; }
+        msleep(200);
+    }
+    if (!found)
     {
         printf("Error loading '%s': File does not exist\n", filename);
         return -1;
